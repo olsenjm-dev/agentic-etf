@@ -420,5 +420,55 @@ def main():
         f.write(report)
     print(report)
 
+    # report.md: same content as Markdown pipe tables. The Slack connector turns these into
+    # native Slack tables, which stay readable on phones; a ``` code block does not.
+    M = []
+    M.append(f"*AGENTIC ETF - MONTHLY SCREEN {today.isoformat()}* (strategy v{strategy.get('version')})")
+    M.append(f"{bench}: 1y {b1*100:+.1f}% · 3y {b3*100:+.1f}% · universe {len(stats)} · survivors {len(survivors)} · groups {len(groups)}")
+    M.append("")
+    M.append("*Candidates* (one per correlation group; score = avg ann. return − ER)")
+    M.append("")
+    M.append("| Grp | Ticker | Score | 1y | 3y | ER | Other members |")
+    M.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for g in group_out:
+        t = g["chosen"]; s = stats.loc[t]
+        M.append(f"| {g['group']} | {t} | {s['score']*100:.1f}% | {s['ret_1y']*100:.1f}% | {s['ret_3y']*100:.1f}% | {s['er_pct']:.2f} | {', '.join(m for m in g['members'] if m != t) or '—'} |")
+    if cross:
+        M.append("")
+        M.append("Between-group avg correlation: " + " · ".join(f"g{a_}–g{b_} {c:.2f}" for a_, b_, c in cross))
+    if added or dropped:
+        M.append("")
+        M.append(f"*ADDED:* {', '.join(added) or '—'}   *DROPPED:* {', '.join(dropped) or '—'}  (holdings in dropped are NOT sold - notice only)")
+    M.append("")
+    M.append("*Pruned / failed screen*")
+    M.append("")
+    M.append("| Ticker | 1y | 3y | Reason |")
+    M.append("| --- | --- | --- | --- |")
+    for t, s in fails.iterrows():
+        if s["pruned"]:
+            why = "pruned: %d mo under %s" % (s["under_streak"], bench)
+        else:
+            why = "under %s on " % bench + "/".join(x for x, ok in (("1y", s["beat_1y"]), ("3y", s["beat_3y"])) if not ok)
+        M.append(f"| {t} | {s['ret_1y']*100:.1f}% | {s['ret_3y']*100:.1f}% | {why} |")
+    if excluded:
+        M.append("")
+        M.append("*Excluded:* " + ", ".join(f"{t} ({r})" for t, r in excluded))
+    M.append("")
+    M.append("*Dip-buy vs blind DCA* (same dollars, every run since logging began)")
+    if cf.empty:
+        M.append("no purchases logged yet")
+    else:
+        M.append("")
+        M.append("| Ticker | $ spent | Dip basis | DCA basis | Adv |")
+        M.append("| --- | --- | --- | --- | --- |")
+        for _, r in cf.sort_values("advantage_pct", ascending=False).iterrows():
+            M.append(f"| {r['ticker']} | {r['dollars']:.2f} | {r['dip_cost_basis']:.2f} | {r['dca_cost_basis']:.2f} | {r['advantage_pct']:+.2f}% |")
+        M.append("")
+        M.append(f"Weighted advantage {w:+.2f}% (${tot:.2f} total)")
+    M.append("")
+    M.append("*Strategy:* " + bt_msg)
+    with open(os.path.join(W, "report.md"), "w") as f:
+        f.write("\n".join(M))
+
 if __name__ == "__main__":
     main()

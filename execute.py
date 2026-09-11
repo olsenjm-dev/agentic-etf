@@ -245,5 +245,26 @@ def write_report(W, cfg, cand, rows, orders, positions, quotes, bp, now, run, st
     open(os.path.join(W, "report.txt"), "w").write(rep)
     print(rep)
 
+    # report.md: same content as a Markdown pipe table (Slack renders it as a native table;
+    # a ``` code block wraps unreadably on phones).
+    M = [f"*AGENTIC ETF {now.strftime('%a %Y-%m-%d %H:%M %Z')}* · run {run} · strategy v{strat.get('version')} · {'PLAN' if filled is None else 'FILLED'}", ""]
+    M.append("| Ticker | Cand | Shares | Price | Equity | Avg cost | P/L % | L H B | Off-hi | Buy $ | Note |")
+    M.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for r in sorted(rows, key=lambda r: (r["ticker"] not in candidates, r["ticker"])):
+        t = r["ticker"]; p = positions.get(t, {}); q = p.get("qty", 0.0); price = r.get("price") or 0.0
+        pl = (price / p["avg_cost"] - 1) * 100 if p.get("avg_cost") and price else np.nan
+        fl = r.get("flags", {}); flag_s = " ".join(IND_SHORT[i] if fl.get(i) else "." for i in IND) if fl else "-"
+        off = r.get("detail", {}).get("off_high_pct", np.nan)
+        dollars = r.get("dollars", 0.0) if filled is None else r.get("filled", 0.0)
+        M.append(f"| {t} | {'Y' if t in candidates else '-'} | {q:.6f} | {price:.2f} | {q*price:.2f} | {(p.get('avg_cost') or 0):.2f} | "
+                 f"{('%+.1f' % pl) if not np.isnan(pl) else '-'} | {flag_s} | "
+                 f"{('%+.1f' % off) if not (isinstance(off, float) and np.isnan(off)) else '-'} | {dollars:.2f} | {r.get('note','')} |")
+    M.append("")
+    M.append(L[-3] if dropped else L[-2])   # indicator legend line
+    M.append(f"Equity {tot_eq:.2f} · buying power {bp if bp is not None else float('nan'):.2f} · buys this run {total_buy:.2f} · floor {cfg['execution']['buying_power_floor']:.0f}")
+    if dropped:
+        M.append(f"*NOTICE* holdings not in current candidate list (no auto-sell): {', '.join(dropped)}")
+    open(os.path.join(W, "report.md"), "w").write("\n".join(M))
+
 if __name__ == "__main__":
     main()

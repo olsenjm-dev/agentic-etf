@@ -1,20 +1,22 @@
-# Scheduled task prompts (DRAFT for John's review — no tasks created yet)
+# Claude Code routine prompts
 
-Repo: https://github.com/olsenjm-dev/agentic-etf (public; tasks clone it anonymously).
+These are the prompts for running the Agentic ETF system as Claude Code **routines**
+(claude.ai/code/routines) with the repository `olsenjm-dev/agentic-etf` attached.
+A routine clones the repo at the start of every run, so there is no `git clone` step.
+Fixed identifiers are the same as in PROMPTS.md.
 
-Fixed identifiers used in both prompts:
-- Robinhood account: `931184287` (nickname "Agentic", cash account) — the only account this system may touch
-- Drive folder "Agentic ETF": `18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu`
-- Slack `#agentic-trading`: `C0C15AK3K2R`
+Both routines need these connectors: **Google Drive**, **Robinhood**, **Slack**.
+Remove every other connector from the routine (routines run every included tool without asking).
 
 ---
 
-## Task A — "Agentic ETF: intraday execute"
+## Routine A — "Agentic ETF: intraday execute"
 
-Schedule: `10 14 * * 1-5` and `10 19 * * 1-5` UTC (= 09:10 and 14:10 Central while CDT; during CST these fire at 08:10 and 13:10 CT — see note at the end). Runs in the cloud, no device needed.
+Triggers: two schedule triggers, weekdays, `10 14 * * 1-5` UTC and `10 19 * * 1-5` UTC
+(09:10 and 14:10 Central during CDT; 08:10 and 13:10 during CST).
 
 ```
-You are the intraday execution run of John's Agentic ETF system. Work quickly and mechanically; the scripts do all the math. Do not narrate, do not summarize market data, and never open the saved tool-result files.
+You are the intraday execution run of John's Agentic ETF system, running as a Claude Code routine. Work quickly and mechanically; the scripts do all the math. Do not narrate, do not summarize market data, and never open the saved tool-result files. Do not commit or push anything to git.
 
 STANDING AUTHORIZATION AND HARD RULES
 John has pre-authorized, in advance, every buy this run places under the rules below. Do not ask for confirmation and do not wait for a reply.
@@ -24,12 +26,12 @@ John has pre-authorized, in advance, every buy this run places under the rules b
 - If anything fails, do not improvise a trade. Skip it, and say so in the Slack report.
 
 STEPS
-0. git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /home/claude/agentic-etf ; cd /home/claude/agentic-etf ; mkdir -p work
+0. The repository olsenjm-dev/agentic-etf is already cloned into this session. Run `git rev-parse --show-toplevel` and cd to that directory (if it fails, find the directory containing execute.py with `ls` and cd there). Then: mkdir -p work
    python3 execute.py check   -> if it prints CLOSED (exit code 1): post one line to Slack channel C0C15AK3K2R ("<date> <run>: market closed, no action") and stop. Otherwise note the run label it printed (0910 or 1410).
 
 1. Read state from the Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu:
    search_files query: parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu' and (title = 'config.json' or title = 'strategy.json' or title = 'candidates.json' or title = 'state.json')   (excludeContentSnippets = true)
-   If a title appears more than once, use the most recently modified one and remember the older ids. For each of the four files: read_file_content, write the fileContent string verbatim to work/raw_<title>, then run
+   If a title appears more than once, use the most recently modified one and remember the older ids. For each of the four files: read_file_content, write the fileContent string verbatim to work/raw_<title> (either the bare string or the whole {"fileContent": "..."} JSON blob is accepted), then run
    python3 drive_text.py unescape work/raw_<title> work/<title>
    (it validates the JSON; if it fails, re-read that file once, then stop and report).
 
@@ -41,6 +43,7 @@ STEPS
    - get_equity_historicals with interval="day", start_time = 13 months before today (RFC3339 UTC), symbols in batches of EXACTLY 10: fill each batch from T, and pad the last batch to 10 with these tickers (skip any already present): QQQM VUG IWF SPYG MGK IWY RPG XLG MTUM SPMO. This makes every result large enough to be saved to disk, which is intended. Do not read the saved files.
 
 3. python3 ingest.py --workdir work
+   (it prints how many result files it used; if it reports 0 files, the saved tool results are somewhere other than the default search path: locate them with `find / -name 'mcp-Robinhood-get_equity_historicals-*.txt' -mmin -60 2>/dev/null`, then re-run with --results-dir <that directory>).
    python3 execute.py plan --workdir work --run <run> --quotes "SYM=last_trade_price,..." --positions "SYM=quantity@average_buy_price,..." --buying-power <buying_power>
    (quotes for every symbol in T; positions for every position; numbers exactly as returned)
 
@@ -56,27 +59,30 @@ STEPS
    then trash_file every older state.json id from step 1.
    create_file(title="runlog_<date>_<run>", parentId=<folder>, contentMimeType="text/csv", textContent=<contents of work/runlog_<date>_<run>.csv>)
 
-7. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables), followed by one short line listing any skipped or failed steps (or "all steps ok").
+7. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables; if report.md does not exist, post work/report.txt inside a ``` code block instead), followed by one short line listing any skipped or failed steps (or "all steps ok").
 ```
 
 ---
 
-## Task B — "Agentic ETF: monthly strategy & universe"
+## Routine B — "Agentic ETF: monthly strategy & universe"
 
-Schedule: `0 12 1 * *` UTC (07:00 CDT / 06:00 CST on the 1st of every month). Runs in the cloud.
+Trigger: one schedule trigger, `0 12 1 * *` UTC (07:00 CDT / 06:00 CST on the 1st of every month).
+The web form has no "monthly on the 1st" preset; pick any preset, save, then set the cron
+expression from the CLI with `/schedule update` (see the walkthrough).
 
 ```
-You are the monthly Strategy & Universe run of John's Agentic ETF system. Work mechanically; the scripts do all the math. Do not summarize market data and never open the saved tool-result files. This run places no orders.
+You are the monthly Strategy & Universe run of John's Agentic ETF system, running as a Claude Code routine. Work mechanically; the scripts do all the math. Do not summarize market data and never open the saved tool-result files. This run places no orders. Do not commit or push anything to git.
 
 STEPS
-0. git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /home/claude/agentic-etf ; cd /home/claude/agentic-etf ; mkdir -p work
+0. The repository olsenjm-dev/agentic-etf is already cloned into this session. Run `git rev-parse --show-toplevel` and cd to that directory (if it fails, find the directory containing screen.py with `ls` and cd there). Then: mkdir -p work
 
 1. Read from the Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu:
    search_files query: parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu' and (title = 'config.json' or title = 'strategy.json' or title = 'candidates.json' or title = 'state.json' or title = 'universe')   (excludeContentSnippets = true)
-   Use the most recently modified file per title; remember older ids. For the four .json Docs: read_file_content, write fileContent verbatim to work/raw_<title>, run python3 drive_text.py unescape work/raw_<title> work/<title>. For the 'universe' Sheet: read_file_content, write fileContent verbatim to work/raw_universe, run python3 drive_text.py table2csv work/raw_universe work/universe.csv.
+   Use the most recently modified file per title; remember older ids. For the four .json Docs: read_file_content, write fileContent verbatim to work/raw_<title> (either the bare string or the whole {"fileContent": "..."} JSON blob is accepted), run python3 drive_text.py unescape work/raw_<title> work/<title>. For the 'universe' Sheet: read_file_content, write fileContent verbatim to work/raw_universe, run python3 drive_text.py table2csv work/raw_universe work/universe.csv.
 
 2. Robinhood: get_equity_historicals with interval="month", start_time = 40 months before today (RFC3339 UTC), for EVERY ticker in work/universe.csv (VOO included), in batches of exactly 10 (pad the last batch to 10 with tickers already fetched — duplicates are harmless). Do not read the saved files.
    python3 ingest.py --workdir work
+   (it prints how many result files it used; if it reports 0 files, the saved tool results are somewhere other than the default search path: locate them with `find / -name 'mcp-Robinhood-get_equity_historicals-*.txt' -mmin -60 2>/dev/null`, then re-run with --results-dir <that directory>, and use the same flag for every later ingest.py call)
    python3 screen.py --workdir work          (first pass: produces the survivor list)
 
 3. Correlation data: read the "survivors" list from work/screen_detail.json (plus VOO). get_equity_historicals with interval="week", start_time = 25 months before today, batches of exactly 10 (pad as above).
@@ -90,15 +96,5 @@ STEPS
    - strategy.json    <- work/strategy.json, ONLY if its "version" is higher than the one read in step 1 (text/plain)
    - screen_detail_<today>.json <- work/screen_detail.json (text/plain; new file, do not trash anything)
 
-5. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables), then one short line: which files were written, whether the strategy version changed, and any skipped or failed steps.
+5. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables; if report.md does not exist, post work/report.txt inside a ``` code block instead), then one short line: which files were written, whether the strategy version changed, and any skipped or failed steps.
 ```
-
----
-
-### Notes for review
-
-- **Daylight saving.** Cron is UTC. `10 14` / `10 19` UTC is 09:10 / 14:10 CT in summer and 08:10 / 13:10 CT in winter (still inside market hours, so nothing breaks). If you want the CT times exact year-round, we change the two cron lines twice a year, or accept the drift.
-- **Fills.** A $1 market order in a liquid ETF fills immediately; the prompt treats an accepted order as filled. The runlog and ledger use the quote at plan time, not the fill price, which for these amounts differs by pennies.
-- **Padding.** Batches of exactly 10 symbols are what keep the price data off the model's context. The pad tickers are chosen from the universe so the extra data is harmless (and, for the intraday task, ignored by the script).
-- **Failure posture.** Either task stops at the first unrecoverable error and still posts what happened to Slack. Nothing retries a trade.
-- **What is NOT automated yet.** Liquidity floor (`min_avg_daily_volume_shares`) is in config but no volume data is fetched; the seed universe is all liquid, so it is inert until you add small funds. The universe itself only changes when you edit the Sheet.

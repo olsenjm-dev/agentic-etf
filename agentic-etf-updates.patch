@@ -1,0 +1,268 @@
+From 8792b8cea44156b34fafd8cd77bed799a4b2818d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 11 Sep 2026 19:39:17 +0000
+Subject: [PATCH 1/2] Emit report.md with Markdown tables for readable Slack
+ posts
+
+screen.py and execute.py now also write work/report.md using Markdown
+pipe tables, which the Slack connector renders as native tables (the
+old ``` code block wrapped unreadably on phones). PROMPTS.md posting
+steps now paste report.md verbatim. Add .gitignore for work/ run data.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WQziQzKs2dSdVegL9kX24b
+---
+ .gitignore |  2 ++
+ PROMPTS.md |  4 ++--
+ execute.py | 21 +++++++++++++++++++++
+ screen.py  | 50 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 75 insertions(+), 2 deletions(-)
+ create mode 100644 .gitignore
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..e958bd4
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++work/
++__pycache__/
+diff --git a/PROMPTS.md b/PROMPTS.md
+index 8c99ed0..704aedc 100644
+--- a/PROMPTS.md
++++ b/PROMPTS.md
+@@ -56,7 +56,7 @@ STEPS
+    then trash_file every older state.json id from step 1.
+    create_file(title="runlog_<date>_<run>", parentId=<folder>, contentMimeType="text/csv", textContent=<contents of work/runlog_<date>_<run>.csv>)
+ 
+-7. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.txt inside a ``` code block, followed by one short line listing any skipped or failed steps (or "all steps ok").
++7. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables), followed by one short line listing any skipped or failed steps (or "all steps ok").
+ ```
+ 
+ ---
+@@ -90,7 +90,7 @@ STEPS
+    - strategy.json    <- work/strategy.json, ONLY if its "version" is higher than the one read in step 1 (text/plain)
+    - screen_detail_<today>.json <- work/screen_detail.json (text/plain; new file, do not trash anything)
+ 
+-5. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.txt inside a ``` code block, then one short line: which files were written, whether the strategy version changed, and any skipped or failed steps.
++5. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables), then one short line: which files were written, whether the strategy version changed, and any skipped or failed steps.
+ ```
+ 
+ ---
+diff --git a/execute.py b/execute.py
+index d6e5cb8..1687adf 100644
+--- a/execute.py
++++ b/execute.py
+@@ -245,5 +245,26 @@ def write_report(W, cfg, cand, rows, orders, positions, quotes, bp, now, run, st
+     open(os.path.join(W, "report.txt"), "w").write(rep)
+     print(rep)
+ 
++    # report.md: same content as a Markdown pipe table (Slack renders it as a native table;
++    # a ``` code block wraps unreadably on phones).
++    M = [f"*AGENTIC ETF {now.strftime('%a %Y-%m-%d %H:%M %Z')}* · run {run} · strategy v{strat.get('version')} · {'PLAN' if filled is None else 'FILLED'}", ""]
++    M.append("| Ticker | Cand | Shares | Price | Equity | Avg cost | P/L % | L H B | Off-hi | Buy $ | Note |")
++    M.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
++    for r in sorted(rows, key=lambda r: (r["ticker"] not in candidates, r["ticker"])):
++        t = r["ticker"]; p = positions.get(t, {}); q = p.get("qty", 0.0); price = r.get("price") or 0.0
++        pl = (price / p["avg_cost"] - 1) * 100 if p.get("avg_cost") and price else np.nan
++        fl = r.get("flags", {}); flag_s = " ".join(IND_SHORT[i] if fl.get(i) else "." for i in IND) if fl else "-"
++        off = r.get("detail", {}).get("off_high_pct", np.nan)
++        dollars = r.get("dollars", 0.0) if filled is None else r.get("filled", 0.0)
++        M.append(f"| {t} | {'Y' if t in candidates else '-'} | {q:.6f} | {price:.2f} | {q*price:.2f} | {(p.get('avg_cost') or 0):.2f} | "
++                 f"{('%+.1f' % pl) if not np.isnan(pl) else '-'} | {flag_s} | "
++                 f"{('%+.1f' % off) if not (isinstance(off, float) and np.isnan(off)) else '-'} | {dollars:.2f} | {r.get('note','')} |")
++    M.append("")
++    M.append(L[-3] if dropped else L[-2])   # indicator legend line
++    M.append(f"Equity {tot_eq:.2f} · buying power {bp if bp is not None else float('nan'):.2f} · buys this run {total_buy:.2f} · floor {cfg['execution']['buying_power_floor']:.0f}")
++    if dropped:
++        M.append(f"*NOTICE* holdings not in current candidate list (no auto-sell): {', '.join(dropped)}")
++    open(os.path.join(W, "report.md"), "w").write("\n".join(M))
++
+ if __name__ == "__main__":
+     main()
+diff --git a/screen.py b/screen.py
+index 7f9f474..cd1632f 100644
+--- a/screen.py
++++ b/screen.py
+@@ -420,5 +420,55 @@ def main():
+         f.write(report)
+     print(report)
+ 
++    # report.md: same content as Markdown pipe tables. The Slack connector turns these into
++    # native Slack tables, which stay readable on phones; a ``` code block does not.
++    M = []
++    M.append(f"*AGENTIC ETF - MONTHLY SCREEN {today.isoformat()}* (strategy v{strategy.get('version')})")
++    M.append(f"{bench}: 1y {b1*100:+.1f}% · 3y {b3*100:+.1f}% · universe {len(stats)} · survivors {len(survivors)} · groups {len(groups)}")
++    M.append("")
++    M.append("*Candidates* (one per correlation group; score = avg ann. return − ER)")
++    M.append("")
++    M.append("| Grp | Ticker | Score | 1y | 3y | ER | Other members |")
++    M.append("| --- | --- | --- | --- | --- | --- | --- |")
++    for g in group_out:
++        t = g["chosen"]; s = stats.loc[t]
++        M.append(f"| {g['group']} | {t} | {s['score']*100:.1f}% | {s['ret_1y']*100:.1f}% | {s['ret_3y']*100:.1f}% | {s['er_pct']:.2f} | {', '.join(m for m in g['members'] if m != t) or '—'} |")
++    if cross:
++        M.append("")
++        M.append("Between-group avg correlation: " + " · ".join(f"g{a_}–g{b_} {c:.2f}" for a_, b_, c in cross))
++    if added or dropped:
++        M.append("")
++        M.append(f"*ADDED:* {', '.join(added) or '—'}   *DROPPED:* {', '.join(dropped) or '—'}  (holdings in dropped are NOT sold - notice only)")
++    M.append("")
++    M.append("*Pruned / failed screen*")
++    M.append("")
++    M.append("| Ticker | 1y | 3y | Reason |")
++    M.append("| --- | --- | --- | --- |")
++    for t, s in fails.iterrows():
++        if s["pruned"]:
++            why = "pruned: %d mo under %s" % (s["under_streak"], bench)
++        else:
++            why = "under %s on " % bench + "/".join(x for x, ok in (("1y", s["beat_1y"]), ("3y", s["beat_3y"])) if not ok)
++        M.append(f"| {t} | {s['ret_1y']*100:.1f}% | {s['ret_3y']*100:.1f}% | {why} |")
++    if excluded:
++        M.append("")
++        M.append("*Excluded:* " + ", ".join(f"{t} ({r})" for t, r in excluded))
++    M.append("")
++    M.append("*Dip-buy vs blind DCA* (same dollars, every run since logging began)")
++    if cf.empty:
++        M.append("no purchases logged yet")
++    else:
++        M.append("")
++        M.append("| Ticker | $ spent | Dip basis | DCA basis | Adv |")
++        M.append("| --- | --- | --- | --- | --- |")
++        for _, r in cf.sort_values("advantage_pct", ascending=False).iterrows():
++            M.append(f"| {r['ticker']} | {r['dollars']:.2f} | {r['dip_cost_basis']:.2f} | {r['dca_cost_basis']:.2f} | {r['advantage_pct']:+.2f}% |")
++        M.append("")
++        M.append(f"Weighted advantage {w:+.2f}% (${tot:.2f} total)")
++    M.append("")
++    M.append("*Strategy:* " + bt_msg)
++    with open(os.path.join(W, "report.md"), "w") as f:
++        f.write("\n".join(M))
++
+ if __name__ == "__main__":
+     main()
+-- 
+2.43.0
+
+
+From cfe74e685a721efc268d62ea6804a889aedc30c2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 11 Sep 2026 20:25:10 +0000
+Subject: [PATCH 2/2] Add ROUTINES.md: prompts for running the tasks as Claude
+ Code routines
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WQziQzKs2dSdVegL9kX24b
+---
+ ROUTINES.md | 100 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 100 insertions(+)
+ create mode 100644 ROUTINES.md
+
+diff --git a/ROUTINES.md b/ROUTINES.md
+new file mode 100644
+index 0000000..fdf3c02
+--- /dev/null
++++ b/ROUTINES.md
+@@ -0,0 +1,100 @@
++# Claude Code routine prompts
++
++These are the prompts for running the Agentic ETF system as Claude Code **routines**
++(claude.ai/code/routines) with the repository `olsenjm-dev/agentic-etf` attached.
++A routine clones the repo at the start of every run, so there is no `git clone` step.
++Fixed identifiers are the same as in PROMPTS.md.
++
++Both routines need these connectors: **Google Drive**, **Robinhood**, **Slack**.
++Remove every other connector from the routine (routines run every included tool without asking).
++
++---
++
++## Routine A — "Agentic ETF: intraday execute"
++
++Triggers: two schedule triggers, weekdays, `10 14 * * 1-5` UTC and `10 19 * * 1-5` UTC
++(09:10 and 14:10 Central during CDT; 08:10 and 13:10 during CST).
++
++```
++You are the intraday execution run of John's Agentic ETF system, running as a Claude Code routine. Work quickly and mechanically; the scripts do all the math. Do not narrate, do not summarize market data, and never open the saved tool-result files. Do not commit or push anything to git.
++
++STANDING AUTHORIZATION AND HARD RULES
++John has pre-authorized, in advance, every buy this run places under the rules below. Do not ask for confirmation and do not wait for a reply.
++- Only Robinhood account 931184287 ("Agentic"). Never touch any other account.
++- Buy only. Never sell, cancel, or place any order the script did not put in work/orders.json, and never change its dollar amounts.
++- Orders are type=market with dollar_amount, market_hours=regular_hours, time_in_force=gfd.
++- If anything fails, do not improvise a trade. Skip it, and say so in the Slack report.
++
++STEPS
++0. The repository olsenjm-dev/agentic-etf is already cloned into this session. Run `git rev-parse --show-toplevel` and cd to that directory (if it fails, find the directory containing execute.py with `ls` and cd there). Then: mkdir -p work
++   python3 execute.py check   -> if it prints CLOSED (exit code 1): post one line to Slack channel C0C15AK3K2R ("<date> <run>: market closed, no action") and stop. Otherwise note the run label it printed (0910 or 1410).
++
++1. Read state from the Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu:
++   search_files query: parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu' and (title = 'config.json' or title = 'strategy.json' or title = 'candidates.json' or title = 'state.json')   (excludeContentSnippets = true)
++   If a title appears more than once, use the most recently modified one and remember the older ids. For each of the four files: read_file_content, write the fileContent string verbatim to work/raw_<title> (either the bare string or the whole {"fileContent": "..."} JSON blob is accepted), then run
++   python3 drive_text.py unescape work/raw_<title> work/<title>
++   (it validates the JSON; if it fails, re-read that file once, then stop and report).
++
++2. Robinhood reads (no writes yet):
++   - get_equity_positions(account_number=931184287)
++   - get_portfolio(account_number=931184287)   -> buying_power.buying_power
++   - T = candidates from work/candidates.json ∪ symbols of current positions
++   - get_equity_quotes(symbols=T)
++   - get_equity_historicals with interval="day", start_time = 13 months before today (RFC3339 UTC), symbols in batches of EXACTLY 10: fill each batch from T, and pad the last batch to 10 with these tickers (skip any already present): QQQM VUG IWF SPYG MGK IWY RPG XLG MTUM SPMO. This makes every result large enough to be saved to disk, which is intended. Do not read the saved files.
++
++3. python3 ingest.py --workdir work
++   (it prints how many result files it used; if it reports 0 files, the saved tool results are somewhere other than the default search path: locate them with `find / -name 'mcp-Robinhood-get_equity_historicals-*.txt' -mmin -60 2>/dev/null`, then re-run with --results-dir <that directory>).
++   python3 execute.py plan --workdir work --run <run> --quotes "SYM=last_trade_price,..." --positions "SYM=quantity@average_buy_price,..." --buying-power <buying_power>
++   (quotes for every symbol in T; positions for every position; numbers exactly as returned)
++
++4. For each order in work/orders.json, in order:
++   review_equity_order(account_number=931184287, symbol, side="buy", type="market", dollar_amount=<dollars as a string with 2 decimals>, market_hours="regular_hours")
++   If the review returns a blocking alert (insufficient buying power, halted, not tradable), skip this order.
++   Otherwise place_equity_order with the same parameters plus a fresh UUID as ref_id. Treat an accepted order (state queued/confirmed/filled) as filled for its dollar amount; a rejected/failed order counts as 0.
++
++5. python3 execute.py record --workdir work --run <run> --filled "SYM=dollars,..." plus the same --quotes, --positions and --buying-power as step 3 (use buying power minus filled dollars).
++
++6. Write state back to Drive:
++   create_file(title="state.json", parentId=<folder>, contentMimeType="text/plain", textContent=<contents of work/state.json>)
++   then trash_file every older state.json id from step 1.
++   create_file(title="runlog_<date>_<run>", parentId=<folder>, contentMimeType="text/csv", textContent=<contents of work/runlog_<date>_<run>.csv>)
++
++7. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables; if report.md does not exist, post work/report.txt inside a ``` code block instead), followed by one short line listing any skipped or failed steps (or "all steps ok").
++```
++
++---
++
++## Routine B — "Agentic ETF: monthly strategy & universe"
++
++Trigger: one schedule trigger, `0 12 1 * *` UTC (07:00 CDT / 06:00 CST on the 1st of every month).
++The web form has no "monthly on the 1st" preset; pick any preset, save, then set the cron
++expression from the CLI with `/schedule update` (see the walkthrough).
++
++```
++You are the monthly Strategy & Universe run of John's Agentic ETF system, running as a Claude Code routine. Work mechanically; the scripts do all the math. Do not summarize market data and never open the saved tool-result files. This run places no orders. Do not commit or push anything to git.
++
++STEPS
++0. The repository olsenjm-dev/agentic-etf is already cloned into this session. Run `git rev-parse --show-toplevel` and cd to that directory (if it fails, find the directory containing screen.py with `ls` and cd there). Then: mkdir -p work
++
++1. Read from the Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu:
++   search_files query: parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu' and (title = 'config.json' or title = 'strategy.json' or title = 'candidates.json' or title = 'state.json' or title = 'universe')   (excludeContentSnippets = true)
++   Use the most recently modified file per title; remember older ids. For the four .json Docs: read_file_content, write fileContent verbatim to work/raw_<title> (either the bare string or the whole {"fileContent": "..."} JSON blob is accepted), run python3 drive_text.py unescape work/raw_<title> work/<title>. For the 'universe' Sheet: read_file_content, write fileContent verbatim to work/raw_universe, run python3 drive_text.py table2csv work/raw_universe work/universe.csv.
++
++2. Robinhood: get_equity_historicals with interval="month", start_time = 40 months before today (RFC3339 UTC), for EVERY ticker in work/universe.csv (VOO included), in batches of exactly 10 (pad the last batch to 10 with tickers already fetched — duplicates are harmless). Do not read the saved files.
++   python3 ingest.py --workdir work
++   (it prints how many result files it used; if it reports 0 files, the saved tool results are somewhere other than the default search path: locate them with `find / -name 'mcp-Robinhood-get_equity_historicals-*.txt' -mmin -60 2>/dev/null`, then re-run with --results-dir <that directory>, and use the same flag for every later ingest.py call)
++   python3 screen.py --workdir work          (first pass: produces the survivor list)
++
++3. Correlation data: read the "survivors" list from work/screen_detail.json (plus VOO). get_equity_historicals with interval="week", start_time = 25 months before today, batches of exactly 10 (pad as above).
++   If today's month is January, April, July or October, also fetch interval="day", start_time = 25 months before today, for the same survivors, batches of exactly 10 (pad as above).
++   python3 ingest.py --workdir work
++   python3 screen.py --workdir work --backtest          (final pass)
++
++4. Write results to Drive (create new, then trash the older id of the same title):
++   - candidates.json  <- work/candidates.json        (text/plain)
++   - state.json       <- work/state.json             (text/plain)
++   - strategy.json    <- work/strategy.json, ONLY if its "version" is higher than the one read in step 1 (text/plain)
++   - screen_detail_<today>.json <- work/screen_detail.json (text/plain; new file, do not trash anything)
++
++5. Post to Slack channel C0C15AK3K2R exactly one message: the contents of work/report.md pasted verbatim as the message text (it contains Markdown pipe tables, which Slack renders as native tables — do NOT wrap it in a ``` code block and do not reformat the tables; if report.md does not exist, post work/report.txt inside a ``` code block instead), then one short line: which files were written, whether the strategy version changed, and any skipped or failed steps.
++```
+-- 
+2.43.0
+
