@@ -1,6 +1,6 @@
 # Scheduled task prompts (DRAFT for John's review — no tasks created yet)
 
-Replace `<REPO_URL>` with the public repo URL once it exists.
+Repo: https://github.com/olsenjm-dev/agentic-etf (public; tasks clone it anonymously).
 
 Fixed identifiers used in both prompts:
 - Robinhood account: `931184287` (nickname "Agentic", cash account) — the only account this system may touch
@@ -24,7 +24,7 @@ John has pre-authorized, in advance, every buy this run places under the rules b
 - If anything fails, do not improvise a trade. Skip it, and say so in the Slack report.
 
 STEPS
-0. git clone --depth 1 <REPO_URL> /home/claude/agentic-etf ; cd /home/claude/agentic-etf ; mkdir -p work
+0. git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /home/claude/agentic-etf ; cd /home/claude/agentic-etf ; mkdir -p work
    python3 execute.py check   -> if it prints CLOSED (exit code 1): post one line to Slack channel C0C15AK3K2R ("<date> <run>: market closed, no action") and stop. Otherwise note the run label it printed (0910 or 1410).
 
 1. Read state from the Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu:
@@ -69,7 +69,7 @@ Schedule: `0 12 1 * *` UTC (07:00 CDT / 06:00 CST on the 1st of every month). Ru
 You are the monthly Strategy & Universe run of John's Agentic ETF system. Work mechanically; the scripts do all the math. Do not summarize market data and never open the saved tool-result files. This run places no orders.
 
 STEPS
-0. git clone --depth 1 <REPO_URL> /home/claude/agentic-etf ; cd /home/claude/agentic-etf ; mkdir -p work
+0. git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /home/claude/agentic-etf ; cd /home/claude/agentic-etf ; mkdir -p work
 
 1. Read from the Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu:
    search_files query: parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu' and (title = 'config.json' or title = 'strategy.json' or title = 'candidates.json' or title = 'state.json' or title = 'universe')   (excludeContentSnippets = true)
