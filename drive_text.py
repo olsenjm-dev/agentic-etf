@@ -19,6 +19,14 @@ def unescape(text):
     text = re.sub(r"\n\n", "\n", text)           # Docs export doubles every newline
     return text.strip() + "\n"
 
+
+def schema_ok(text):
+    obj = json.loads(text)                           # raises if the round trip corrupted anything
+    sv = obj.get("schema_version") if isinstance(obj, dict) else None
+    if sv != "top5-v1":
+        sys.exit(f"ERROR: schema_version is {sv!r}, expected 'top5-v1' - hard fail")
+
+
 def table2csv(text):
     rows = []
     for line in text.splitlines():
@@ -45,7 +53,7 @@ def main():
     if mode == "unescape":
         out = unescape(raw)
         if dst.endswith(".json"):
-            json.loads(out)                          # raises if the round trip corrupted anything
+            schema_ok(out)
         open(dst, "w", encoding="utf-8").write(out)
     elif mode == "table2csv":
         rows = table2csv(raw)

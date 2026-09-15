@@ -1,0 +1,43 @@
+{
+  "schema_version": "top5-v1",
+  "version": 1,
+  "as_of": "2026-09-15",
+  "params": {
+    "top_n": 5,
+    "excess_min_pp": 0.5,
+    "w_6m": 0.25,
+    "w_1y": 0.35,
+    "w_3y": 0.4,
+    "er_penalty": 1.0,
+    "incumbent_bonus": 1.0,
+    "scoring": "raw",
+    "ir_scale": 10.0,
+    "resid_corr_max": 0.6,
+    "resid_corr_step": 0.05,
+    "resid_corr_ceiling": 0.85,
+    "tie_band": 0.25,
+    "corr_window_days": 504,
+    "min_history_months": 39,
+    "mdd_max_years": 5,
+    "exit_months_outside": 2,
+    "volume_floor_usd": 5000000
+  },
+  "backtest": {
+    "min_live_months": 3,
+    "auto_apply_min_pp": 2.0,
+    "require_mdd_not_worse": true,
+    "min_proposal_pp": 0.5,
+    "max_variants": 10,
+    "min_months": 12,
+    "lookback_years": 10,
+    "noise_warning_live_months": 24
+  },
+  "changelog": [
+    {
+      "version": 1,
+      "date": "2026-09-15",
+      "change": "initial parameters (repo defaults)",
+      "evidence": null
+    }
+  ]
+}

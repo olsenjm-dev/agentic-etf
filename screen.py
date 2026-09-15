@@ -1,474 +1,440 @@
 #!/usr/bin/env python3
 """
-Monthly Strategy & Universe script for the Agentic ETF system.
+Monthly Top-5 Growth ETF Screen (notification only - never trades).
 
-Runs entirely on local files in a working directory (default: ./work).
-The scheduled task is responsible for fetching data from Robinhood and
-writing the CSV inputs; this script does all the arithmetic so that no
-reasoning tokens are spent on math.
+  python3 screen.py plan --workdir work [--today YYYY-MM-DD]
+      Needs work/universe.csv (+ optional work/current.json, work/performance.json).
+      Prints the anchor month, the idempotency runlog title, the Robinhood fetch window and the
+      batches of exactly 10 symbols. Writes work/plan.json.
 
-Inputs (in workdir):
-  universe.csv          ticker,name,category,expense_ratio_pct,note
-  config.json           see config.json
-  strategy.json         current dip-indicator parameters
-  state.json            (optional) prune streaks + cooldowns; created if missing
-  prices_monthly.csv    date,ticker,close   -- month-end closes, >= 37 months, all universe tickers + VOO
-  prices_weekly.csv     date,ticker,close   -- (optional) weekly closes for survivors + VOO, used for correlation
-  volumes.csv           ticker,avg_volume   -- (optional) average daily volume for liquidity floor
-  (the running dip-vs-DCA ledger lives in state.json["ledger"], maintained by execute.py)
-  prices_daily.csv      date,ticker,close,high,low -- (optional) only in backtest months
+  python3 screen.py run --workdir work [--today YYYY-MM-DD] [--untradable T1,T2] [--bootstrap-strategy]
+      Needs work/daily.csv.gz (ingest.py), work/universe.csv, work/strategy.json
+      (or --bootstrap-strategy to start from strategy_default.json), optional current.json,
+      performance.json, proposals.json. Writes everything to work/out/ and lists the Drive writes.
 
-Outputs (in workdir):
-  candidates.json       chosen candidate per group (small; read by every intraday run)
-  screen_detail.json    full per-ticker stats, exclusions (monthly record only)
-  state.json            updated prune streaks (cooldowns and ledger untouched)
-  strategy.json         updated only if a backtest passed the auto-apply gate
-  report.txt            Slack-ready monospaced report
-
-Usage:  python3 screen.py [--workdir DIR] [--backtest] [--force-backtest]
+All arithmetic, selection and report text come from this script.
 """
-import argparse, json, math, os, sys, glob
-from datetime import date, datetime
-import numpy as np
+import argparse
+import json
+import os
+import shutil
+import sys
+from datetime import datetime, timezone
+
 import pandas as pd
 
-# ----------------------------------------------------------------------------- io helpers
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engine as E  # noqa: E402
+from common import (BENCH, HERE, SCHEMA, add_months, batches, die, load_json, load_universe,  # noqa: E402
+                    month_label, norm_month, parse_date, prior_month_label, rfc3339, rnd, run_month_first,
+                    save_json, to_bool, utc_today, write_universe, write_writes)
 
-def load_json(path, default=None):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return default if default is not None else {}
+HORIZONS = [1, 3, 6, 12]
+REPORT_LIMIT = 4900
 
-def save_json(path, obj):
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
 
-def load_prices(path):
-    """Long CSV (date,ticker,close[,high,low]) -> wide DataFrame of closes indexed by date."""
-    df = pd.read_csv(path, parse_dates=["date"])
-    df["ticker"] = df["ticker"].str.upper().str.strip()
-    wide = df.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
-    return wide
+def today_arg(s):
+    return parse_date(s) if s else utc_today()
 
-# ----------------------------------------------------------------------------- screening
 
-def total_return(wide, ticker, months):
-    s = wide[ticker].dropna()
-    if len(s) < months + 1:
-        return np.nan
-    return s.iloc[-1] / s.iloc[-1 - months] - 1.0
+def held_from_current(cur):
+    """{ticker: months_outside} for the list in force BEFORE this anchor month."""
+    if not cur:
+        return {}
+    return {**{t: 0 for t in cur.get("top5", [])}, **{t: int(m) for t, m in cur.get("on_watch", {}).items()}}
 
-def annualized(tr, years):
-    if pd.isna(tr):
-        return np.nan
-    return (1.0 + tr) ** (1.0 / years) - 1.0
 
-def monthly_returns(wide):
-    return wide.pct_change().dropna(how="all")
+def prior_state(cur, anchor_month):
+    """If current.json already reflects this anchor month (a retried run), use the state it replaced."""
+    if cur and cur.get("anchor_month") == anchor_month:
+        return cur.get("previous") or {}
+    return cur or {}
 
-def consecutive_months_under(mret, ticker, bench):
-    """Count of most-recent consecutive months where ticker's monthly return < benchmark's."""
-    diff = (mret[ticker] - mret[bench]).dropna()
-    n = 0
-    for v in diff.iloc[::-1]:
-        if v < 0:
-            n += 1
+
+# ------------------------------------------------------------------ plan
+def cmd_plan(a):
+    wd = a.workdir
+    today = today_arg(a.today)
+    rows = load_universe(os.path.join(wd, "universe.csv"))
+    cur = load_json(os.path.join(wd, "current.json"), required=False)
+    perf = load_json(os.path.join(wd, "performance.json"), required=False, default={"lists": []})
+    anchor_month = prior_month_label(today)
+    first = run_month_first(today)
+    tick = []
+    for r in rows:
+        if to_bool(r.get("active")):
+            tick.append(r["ticker"])
         else:
-            break
-    return n
+            ef = norm_month(r.get("eligible_from", ""))
+            if ef and ef <= anchor_month:
+                tick.append(r["ticker"])
+    cur = prior_state(cur, anchor_month)
+    tick += list(held_from_current(cur))
+    for e in perf.get("lists", [])[-13:]:
+        tick += e.get("held", []) + e.get("comparator", [])
+    tick = [BENCH] + [t for t in tick if t != BENCH]
+    start = add_months(first, -60)
+    start = start.replace(day=1)
+    start = pd.Timestamp(start) - pd.Timedelta(days=10)
+    plan = {
+        "schema_version": SCHEMA,
+        "anchor_month": anchor_month,
+        "runlog_title": f"runlog_{anchor_month}.json",
+        "start_time": rfc3339(start.date()),
+        "end_time": rfc3339(first),
+        "batches": batches(tick),
+    }
+    save_json(os.path.join(wd, "plan.json"), plan)
+    print(f"anchor month: {anchor_month}   idempotency check: Drive title '{plan['runlog_title']}'")
+    print(f"historicals: interval=day start_time={plan['start_time']} end_time={plan['end_time']}")
+    print(f"{len(plan['batches'])} batches x 3 calls (adjustment_type split, all, none):")
+    for b in plan["batches"]:
+        print("  " + json.dumps(b))
 
-def correlation_groups(ret, threshold):
-    """
-    Average-linkage agglomerative clustering on 1 - corr.
-    Merge while the average pairwise correlation between two clusters >= threshold.
-    Returns list of lists of tickers (deterministic order).
-    """
-    tickers = list(ret.columns)
-    if len(tickers) <= 1:
-        return [tickers]
-    corr = ret.corr().values
-    clusters = [[i] for i in range(len(tickers))]
-    while True:
-        best, bi, bj = -1.0, -1, -1
-        for a in range(len(clusters)):
-            for b in range(a + 1, len(clusters)):
-                vals = [corr[i, j] for i in clusters[a] for j in clusters[b]]
-                avg = float(np.mean(vals))
-                if avg > best:
-                    best, bi, bj = avg, a, b
-        if best < threshold or bi < 0:
-            break
-        clusters[bi] = clusters[bi] + clusters[bj]
-        del clusters[bj]
-    groups = [sorted(tickers[i] for i in c) for c in clusters]
-    groups.sort(key=lambda g: (-len(g), g[0]))
-    return groups
 
-def group_cross_corr(ret, groups):
-    """Average correlation between each pair of groups (for the report)."""
-    corr = ret.corr()
-    out = []
-    for a in range(len(groups)):
-        for b in range(a + 1, len(groups)):
-            vals = [corr.loc[i, j] for i in groups[a] for j in groups[b]]
-            out.append((a + 1, b + 1, float(np.mean(vals))))
-    return out
+# ------------------------------------------------------------------ run
+def fmt(x, w, d=1, sign=True):
+    if x is None or x != x:
+        return "n/a".rjust(w)
+    return (f"{x:+.{d}f}" if sign else f"{x:.{d}f}").rjust(w)
 
-# ----------------------------------------------------------------------------- ledger / counterfactual
 
-def fold_runlogs_into_ledger(workdir, ledger):
-    """
-    Each runlog row records, for every candidate at every run: price, and dollars actually bought.
-    Actual:         sum(dollars), sum(dollars/price)  -> cost basis
-    Counterfactual: same total dollars spread evenly over every run observed -> blind-DCA cost basis.
-    We keep per-ticker running sums so old logs never need to be re-read.
-    """
-    files = sorted(glob.glob(os.path.join(workdir, "runlog_*.csv")))
-    folded = set(ledger.get("folded_files", []))
-    for path in files:
-        name = os.path.basename(path)
-        if name in folded:
-            continue
-        df = pd.read_csv(path)
-        if df.empty:
-            folded.add(name); continue
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df["dollars"] = pd.to_numeric(df.get("dollars", 0), errors="coerce").fillna(0.0)
-        df = df.dropna(subset=["price"])
-        for t, g in df.groupby("ticker"):
-            L = ledger.setdefault("tickers", {}).setdefault(t, {
-                "runs": 0, "sum_inv_price": 0.0, "actual_dollars": 0.0, "actual_shares": 0.0})
-            L["runs"] += int(len(g))
-            L["sum_inv_price"] += float((1.0 / g["price"]).sum())
-            L["actual_dollars"] += float(g["dollars"].sum())
-            L["actual_shares"] += float((g["dollars"] / g["price"]).sum())
-        folded.add(name)
-    ledger["folded_files"] = sorted(folded)
-    return ledger
+def fwd_return(panel, tickers, d0, d1):
+    vals = []
+    missing = []
+    for t in tickers:
+        v0, v1 = panel.value(t, d0), panel.value(t, d1)
+        if v0 is None or v1 is None:
+            missing.append(t)
+        else:
+            vals.append(v1 / v0 - 1)
+    if not vals:
+        return None, missing
+    return sum(vals) / len(vals) * 100, missing
 
-def counterfactual_table(ledger):
-    rows = []
-    for t, L in ledger.get("tickers", {}).items():
-        if L["actual_dollars"] <= 0 or L["runs"] == 0:
-            continue
-        actual_cb = L["actual_dollars"] / L["actual_shares"]
-        # blind DCA: same dollars, equal slice every run -> shares = D/runs * sum(1/p)
-        cf_shares = (L["actual_dollars"] / L["runs"]) * L["sum_inv_price"]
-        cf_cb = L["actual_dollars"] / cf_shares
-        rows.append({"ticker": t, "dollars": L["actual_dollars"], "dip_cost_basis": actual_cb,
-                     "dca_cost_basis": cf_cb, "advantage_pct": (cf_cb / actual_cb - 1.0) * 100.0})
-    return pd.DataFrame(rows)
 
-# ----------------------------------------------------------------------------- backtest of dip rules
-
-def indicator_flags(daily, p):
-    """daily: DataFrame with close, high, low for one ticker (ascending). Returns DataFrame of bool flags."""
-    c, h, l = daily["close"], daily["high"], daily["low"]
-    n = int(p["n_day_low"]["n"])
-    prior_low = l.shift(1).rolling(n).min()
-    f1 = c <= prior_low
-    hi52 = h.shift(1).rolling(252, min_periods=120).max()
-    f2 = c <= hi52 * (1.0 - float(p["pct_off_52w_high"]["pct"]) / 100.0)
-    per, k = int(p["bollinger_lower"]["period"]), float(p["bollinger_lower"]["num_std"])
-    sma = c.rolling(per).mean(); sd = c.rolling(per).std(ddof=0)
-    f3 = c <= sma - k * sd
-    out = pd.DataFrame({"n_day_low": f1, "pct_off_52w_high": f2, "bollinger_lower": f3}).fillna(False)
-    for k_ in out.columns:
-        if not p[k_].get("enabled", True):
-            out[k_] = False
-    return out
-
-MIN_BARS = 300
-
-def backtest_params(daily_by_ticker, params, dollars_per_ind):
-    """
-    Simulate: each day, buy dollars_per_ind per tripped indicator (once per day per indicator).
-    Metric: advantage of dip cost basis over blind DCA of the same dollars across all days (pp),
-    averaged across tickers; plus worst drawdown of position value vs cost.
-    """
-    advs, dds = [], []
-    for t, d in daily_by_ticker.items():
-        d = d.dropna().sort_index()
-        if len(d) < MIN_BARS:
-            continue
-        flags = indicator_flags(d, params)
-        n_trip = flags.sum(axis=1)
-        dollars = n_trip * dollars_per_ind
-        total = float(dollars.sum())
-        if total <= 0:
-            continue
-        shares = (dollars / d["close"]).cumsum()
-        cost = dollars.cumsum()
-        actual_cb = total / float(shares.iloc[-1])
-        cf_shares = (total / len(d)) * float((1.0 / d["close"]).sum())
-        cf_cb = total / cf_shares
-        advs.append((cf_cb / actual_cb - 1.0) * 100.0)
-        value = shares * d["close"]
-        pnl = (value / cost.replace(0, np.nan) - 1.0).fillna(0.0)
-        dds.append(float(pnl.min()))
-    if not advs:
+def month_end(panel, month):
+    """Last trading day in YYYY-MM (None if the month is not complete in the data)."""
+    y, m = int(month[:4]), int(month[5:7])
+    nxt = add_months(datetime(y, m, 1).date(), 1)
+    d = panel.on_or_before(pd.Timestamp(nxt) - pd.Timedelta(days=1))
+    if d is None or month_label(d.date()) != month:
         return None
-    return {"advantage_pp": float(np.mean(advs)), "worst_drawdown": float(np.min(dds)), "tickers": len(advs)}
+    return d
 
-def parameter_grid(base):
-    """Small neighbourhood grid around the current parameters (keeps the search honest and cheap)."""
-    grid = []
-    for n in sorted({3, 5, 10, base["n_day_low"]["n"]}):
-        for pct in sorted({5.0, 10.0, 15.0, 20.0, float(base["pct_off_52w_high"]["pct"])}):
-            for per, k in {(20, 2.0), (20, 2.5), (10, 2.0), (50, 2.0),
-                           (int(base["bollinger_lower"]["period"]), float(base["bollinger_lower"]["num_std"]))}:
-                p = json.loads(json.dumps(base))
-                p["n_day_low"]["n"] = n
-                p["pct_off_52w_high"]["pct"] = pct
-                p["bollinger_lower"]["period"] = per
-                p["bollinger_lower"]["num_std"] = k
-                grid.append(p)
-    return grid
 
-def run_backtest(workdir, cfg, strategy, candidates, today):
-    path = os.path.join(workdir, "prices_daily.csv")
-    if not os.path.exists(path):
-        return None, "backtest skipped: prices_daily.csv not present"
-    df = pd.read_csv(path, parse_dates=["date"])
-    df["ticker"] = df["ticker"].str.upper().str.strip()
-    by = {t: g.set_index("date")[["close", "high", "low"]] for t, g in df.groupby("ticker") if t in candidates}
-    if not by:
-        return None, "backtest skipped: no candidate tickers in prices_daily.csv"
-    dpi = float(cfg["execution"]["dollars_per_indicator"])
-    base = strategy["indicators"]
-    current = backtest_params(by, base, dpi)
-    if current is None:
-        return None, "backtest skipped: fewer than %d daily bars" % MIN_BARS + " for every candidate"
-    best, best_p = current, base
-    for p in parameter_grid(base):
-        r = backtest_params(by, p, dpi)
-        if r is None:
-            continue
-        if r["advantage_pp"] > best["advantage_pp"] + 1e-9:
-            best, best_p = r, p
-    gate = cfg["strategy_adaptation"]
-    improvement = best["advantage_pp"] - current["advantage_pp"]
-    dd_ok = (not gate["auto_apply_require_drawdown_not_worse"]) or (best["worst_drawdown"] >= current["worst_drawdown"] - 1e-9)
-    applied = improvement >= float(gate["auto_apply_min_improvement_pp"]) and dd_ok and best_p != base
-    msg = (f"backtest ({len(by)} tickers): current adv {current['advantage_pp']:+.2f}pp dd {current['worst_drawdown']*100:.1f}% | "
-           f"best adv {best['advantage_pp']:+.2f}pp dd {best['worst_drawdown']*100:.1f}% | "
-           f"improvement {improvement:+.2f}pp -> {'APPLIED' if applied else 'not applied'}")
-    if applied:
-        strategy["indicators"] = best_p
-        strategy["version"] = int(strategy.get("version", 1)) + 1
-        strategy["as_of"] = today.isoformat()
-        strategy.setdefault("history", []).append({
-            "version": strategy["version"], "as_of": today.isoformat(),
-            "reason": msg, "params": best_p})
-        save_json(os.path.join(workdir, "strategy.json"), strategy)
-    return applied, msg
+def update_performance(panel, perf, entry, A):
+    lists = [e for e in perf.get("lists", []) if e["month"] != entry["month"]]
+    lists.append(entry)
+    lists.sort(key=lambda e: e["month"])
+    gaps = []
+    Am = month_label(A.date())
+    for e in lists:
+        fwd = e.setdefault("fwd", {})
+        d0 = pd.Timestamp(e["anchor"])
+        for h in HORIZONS:
+            if str(h) in fwd:
+                continue
+            tm = month_label(add_months(datetime.strptime(e["month"] + "-01", "%Y-%m-%d").date(), h))
+            if tm > Am:
+                continue
+            d1 = month_end(panel, tm)
+            if d1 is None or d0 not in panel.dates:
+                gaps.append(f"fwd {h}M for {e['month']} list: no price calendar")
+                continue
+            lr, m1 = fwd_return(panel, e["held"], d0, d1)
+            cr, m2 = fwd_return(panel, e["comparator"], d0, d1)
+            vr, _ = fwd_return(panel, [BENCH], d0, d1)
+            if m1 or m2:
+                gaps.append(f"fwd {h}M for {e['month']}: no data for {' '.join(sorted(set(m1 + m2)))}")
+            fwd[str(h)] = [rnd(lr), rnd(vr), rnd(cr)]
+    perf["lists"] = lists
+    parts = []
+    for h in HORIZONS:
+        src = month_label(add_months(A.date().replace(day=1), -h))
+        e = next((x for x in lists if x["month"] == src), None)
+        v = (e or {}).get("fwd", {}).get(str(h))
+        if v:
+            parts.append(f"{h}M " + "|".join("n/a" if x is None else f"{x:+.1f}" for x in v))
+        else:
+            parts.append(f"{h}M n/a")
+    return perf, "  ".join(parts), gaps
 
-# ----------------------------------------------------------------------------- main
+
+def cmd_run(a):
+    wd = a.workdir
+    out = os.path.join(wd, "out")
+    os.makedirs(out, exist_ok=True)
+    today = today_arg(a.today)
+    anchor_month = prior_month_label(today)
+    first = run_month_first(today)
+    writes = []
+
+    # ---- inputs
+    spath = os.path.join(wd, "strategy.json")
+    bootstrapped = False
+    if not os.path.exists(spath):
+        if not a.bootstrap_strategy:
+            die("work/strategy.json missing - pass --bootstrap-strategy only if Drive has no strategy.json")
+        shutil.copy(os.path.join(HERE, "strategy_default.json"), spath)
+        bootstrapped = True
+    strat = load_json(spath)
+    P = strat["params"]
+    rows = load_universe(os.path.join(wd, "universe.csv"))
+    cur_raw = load_json(os.path.join(wd, "current.json"), required=False)
+    cur = prior_state(cur_raw, anchor_month)
+    perf = load_json(os.path.join(wd, "performance.json"), required=False, default=None)
+    props = load_json(os.path.join(wd, "proposals.json"), required=False, default=None)
+    daily = pd.read_csv(os.path.join(wd, "daily.csv.gz"))
+    panel = E.Panel(daily, rows)
+    A = panel.on_or_before(pd.Timestamp(first) - pd.Timedelta(days=1))
+    if A is None or month_label(A.date()) != anchor_month:
+        die(f"price data does not reach {anchor_month} (last {BENCH} bar {panel.dates[-1].date()})")
+    tr_basis = ("dividend-adjusted (split/dividend series from Robinhood)" if not panel.fallback else
+                "dividend-adjusted, EXCEPT price + distribution_yield fallback for: " + " ".join(sorted(panel.fallback)))
+
+    # ---- universe maintenance: on-deck flips, hard-eligibility deactivations
+    untradable = {t.strip().upper() for t in (a.untradable or "").split(",") if t.strip()}
+    flips, deact = [], {}
+    changed = False
+    for r in rows:
+        t = r["ticker"]
+        if not to_bool(r.get("active")):
+            ef = norm_month(r.get("eligible_from"))
+            if ef and ef <= anchor_month and not (r.get("notes", "").startswith("DEACTIVATED")):
+                r["active"] = "TRUE"
+                flips.append(t)
+                changed = True
+            else:
+                continue
+        reason = None
+        if t in untradable:
+            reason = "not tradable on Robinhood"
+        elif t not in panel.tr.columns or panel.last_valid.get(t) is None:
+            reason = "no price data (delisted?)"
+        elif (A - panel.last_valid[t]).days > 7:
+            reason = f"no price since {panel.last_valid[t].date()} (delisted?)"
+        else:
+            mdv = panel.median_dollar_volume(t, A)
+            if mdv is not None:
+                r["avg_dollar_volume_30d"] = str(int(round(mdv)))   # saved only if the sheet is rewritten anyway
+            if mdv is None or mdv < float(P["volume_floor_usd"]):
+                reason = f"30-day median dollar volume ${(mdv or 0) / 1e6:.2f}M < ${float(P['volume_floor_usd']) / 1e6:.2f}M"
+        if reason:
+            r["active"] = "FALSE"
+            r["eligible_from"] = ""
+            r["notes"] = f"DEACTIVATED {A.date()}: {reason}. " + r.get("notes", "")
+            deact[t] = reason
+            changed = True
+    inactive_prior = {t: "inactive in universe" for t in held_from_current(cur)
+                      if t not in deact and not any(r["ticker"] == t and to_bool(r.get("active")) for r in rows)}
+    deact_all = {**inactive_prior, **deact}
+
+    # ---- Stage A
+    elig, young = E.eligible_at(rows, A, P, panel)
+    meta = E.universe_meta(rows)
+    df, bench, gaps, rets = E.compute_metrics(panel, A, elig, P, meta)
+
+    # ---- Stage B
+    survivors, fails = E.stage_b(df, P)
+
+    # ---- Stage C
+    prior = held_from_current(cur)
+    sc = E.score(df, P, set(prior))
+    sc_raw = E.score(df, P, set(), use_bonus=False)
+    df["score"] = sc
+    ranked_all = E.rank_order(sc.loc[survivors]) if survivors else []
+
+    # ---- Stage D
+    cat = {t: meta[t].get("category", "") for t in df.index}
+    mdd = df["mdd"].to_dict()
+    C = E.residual_corr(rets, survivors) if len(survivors) > 1 else pd.DataFrame(1.0, index=survivors, columns=survivors)
+    selected, steps, cmax, use_cat = E.select(survivors, sc, C, cat, mdd, P)
+    comparator = E.rank_order(sc_raw.loc[survivors])[:int(P["top_n"])] if survivors else []
+
+    # ---- Stage E
+    on_watch, removed, added = E.apply_exits(prior, selected, survivors, fails, gaps, deact_all, P)
+    held = selected + sorted(on_watch)
+
+    # ---- near misses (ranks 6-8 by score among survivors not selected)
+    nm = [t for t in ranked_all if t not in selected][:3]
+    near = [(ranked_all.index(t) + 1, t, float(sc[t]),
+             E.why_not(t, selected, sc, C, cat, cmax, use_cat, float(P["tie_band"]))) for t in nm]
+
+    # ---- performance
+    entry = {"month": anchor_month, "anchor": A.date().isoformat(), "held": held, "comparator": comparator,
+             "strategy_version": strat.get("version")}
+    perf_obj = perf or {"lists": []}
+    perf_obj, fwd_line, perf_gaps = update_performance(panel, perf_obj, entry, A)
+
+    # ---- proposals
+    pending = [p for p in (props or {}).get("proposals", []) if p.get("status") == "pending"]
+
+    # ---- outputs
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    top5_rows = []
+    for i, t in enumerate(selected, 1):
+        r = df.loc[t]
+        top5_rows.append({"rank": i, "ticker": t, "name": meta[t].get("name", ""), "category": cat[t],
+                          "region": r["region"], "score": rnd(sc[t]), "ex6a": rnd(r["ex6a"]), "ex1": rnd(r["ex1"]),
+                          "ex3a": rnd(r["ex3a"]), "ir": rnd(r["ir"]), "mdd": rnd(r["mdd"]),
+                          "expense_ratio": rnd(r["er"], 3),
+                          "fractional_eligible": to_bool(meta[t].get("fractional_eligible")),
+                          "status": "held" if t in prior else "new"})
+    current = {
+        "anchor_month": anchor_month, "anchor_date": A.date().isoformat(), "generated": now,
+        "strategy_version": strat.get("version"), "tr_basis": tr_basis,
+        "top5": selected, "on_watch": on_watch, "held": held, "comparator": comparator,
+        "detail": top5_rows,
+        "previous": {k: v for k, v in (cur or {}).items() if k in ("anchor_month", "top5", "on_watch")},
+    }
+    save_json(os.path.join(out, "current.json"), current)
+    save_json(os.path.join(out, "performance.json"), perf_obj)
+
+    cols = ["status", "score", "ex6a", "ex1", "ex3a", "ex6c", "ex3c", "ir", "te", "mdd", "mdd_years", "er",
+            "category", "region"]
+    hist_rows = []
+    for t in df.index:
+        st = ("selected" if t in selected else "on-watch" if t in on_watch else "survivor" if t in survivors
+              else "failed-B")
+        r = df.loc[t]
+        hist_rows.append([t, st, rnd(sc[t]), rnd(r["ex6a"]), rnd(r["ex1"]), rnd(r["ex3a"]), rnd(r["ex6c"]),
+                          rnd(r["ex3c"]), rnd(r["ir"]), rnd(r["te"]), rnd(r["mdd"]), rnd(r["mdd_years"], 1),
+                          rnd(r["er"], 3), r["category"], r["region"]])
+    hist_rows.sort(key=lambda x: (-(x[2] if x[1] != "failed-B" else -1e9), x[0]))
+    history = {
+        "anchor_month": anchor_month, "anchor_date": A.date().isoformat(), "strategy_version": strat.get("version"),
+        "params": P, "tr_basis": tr_basis,
+        "bench": {k: rnd(v) for k, v in bench.items()},
+        "columns": ["ticker"] + cols,
+        "rows": hist_rows,
+        "rank_order": ranked_all,
+        "selected": selected, "comparator": comparator, "on_watch": on_watch,
+        "relaxation": steps, "stage_b_failures": fails, "not_eligible_young": young, "data_gaps": gaps,
+        "resid_corr_selected": {t: {s: rnd(C.at[t, s]) for s in selected if s != t} for t in selected},
+    }
+    save_json(os.path.join(out, f"history_{anchor_month}.json"), history)
+
+    cache = {"anchor_month": anchor_month, "anchor_date": A.date().isoformat(),
+             "columns": ["ticker", "close", "div_ttm", "tr_6m", "tr_1y", "tr_3y", "verified"], "rows": []}
+    W = E.windows(panel, A)
+    iA = panel.dates.get_loc(A)
+    for t in sorted(set(df.index) | {BENCH}):
+        v = {k: panel.value(t, W[k]) for k in ("A", "s6", "s1", "s3")}
+        px = panel.close[t].iloc[iA] if t in panel.close.columns else None
+        dsum = None
+        if t in panel.close.columns:
+            dd = daily[(daily.ticker == t)]
+            dd = dd[(pd.to_datetime(dd.date) > W["s1"]) & (pd.to_datetime(dd.date) <= A)]
+            dsum = float(dd["div"].sum())
+        tr = [rnd((v["A"] / v[k] - 1) * 100) if v["A"] and v[k] else None for k in ("s6", "s1", "s3")]
+        cache["rows"].append([t, rnd(px, 4), rnd(dsum, 4)] + tr + [bool(panel.verified.get(t, False))])
+    save_json(os.path.join(out, f"cache_prices_{anchor_month}.json"), cache)
+
+    if changed:
+        write_universe(os.path.join(out, "universe.csv"), rows)
+
+    # ---- report
+    L = []
+    L.append(f"TOP-5 GROWTH ETF SCREEN  anchor {A.date()}  (run {today}, strategy v{strat.get('version')})")
+    L.append("Notification only - no orders. Total return: " + tr_basis)
+    n_active = sum(1 for r in rows if to_bool(r.get("active")))
+    L.append(f"Universe {n_active} active | eligible {len(df)} | passed filter {len(survivors)} | "
+             f"list {len(selected)} + {len(on_watch)} on-watch")
+    L.append(f"VOO: 6M {bench['r6']:+.1f}%  1Y {bench['r1']:+.1f}%  3Y {bench['r3']:+.1f}% "
+             f"({bench['cagr3']:+.1f}%/yr)")
+    L.append("")
+    L.append(" # TICKER CATEGORY         REG     6Mx    1Yx    3Yx   SCORE    IR  MDD(yrs)   ER  STATUS")
+    reg_abbr = {"US": "US", "developed-ex-US": "DXU", "emerging": "EM", "global": "GL"}
+
+    def line(rank, t, status):
+        r = df.loc[t]
+        return (f"{rank:>2} {t:<6} {cat[t][:16]:<16} {reg_abbr.get(r['region'], r['region'][:3]):<4}"
+                f"{fmt(r['ex6a'], 7)}{fmt(r['ex1'], 7)}{fmt(r['ex3a'], 7)}{fmt(sc[t], 8, 2, False)}"
+                f"{fmt(r['ir'], 6, 2, False)} {fmt(r['mdd'], 6)}({r['mdd_years']:.0f}) {r['er']:5.2f}  {status}")
+    for i, t in enumerate(selected, 1):
+        L.append(line(i, t, "held" if t in prior else "NEW"))
+    for t in sorted(on_watch):
+        if t in df.index:
+            L.append(line(ranked_all.index(t) + 1 if t in ranked_all else 0, t, f"on-watch {on_watch[t]}/{P['exit_months_outside']}"))
+        else:
+            L.append(f"   {t:<6} (not evaluated this month)                              on-watch {on_watch[t]}/{P['exit_months_outside']}")
+    if not selected:
+        L.append("   (no fund beat VOO on all three windows this month)")
+    L.append("x = excess vs VOO in pp (6M annualized, 1Y, 3Y CAGR). MDD % over years shown. # = rank by score.")
+    L.append("")
+    L.append("Additions: " + (", ".join(f"{t} (entered the top five)" for t in added) or "none."))
+    L.append("Removals: " + ("; ".join(f"{t} - {why}" for t, why in removed) or "none."))
+    L.append("On-watch: " + (", ".join(f"{t} ({m} month outside the top five; removed at {P['exit_months_outside']})"
+                                       for t, m in sorted(on_watch.items())) or "none."))
+    L.append("Near misses: " + ("; ".join(f"#{k} {t} score {s:.2f} - {why}" for k, t, s, why in near) or "none."))
+    L.append("Relaxation: " + ("; ".join(steps) if steps else
+                               f"none (resid corr <= {float(P['resid_corr_max']):.2f}, one fund per category)."))
+    if len(selected) < int(P["top_n"]):
+        L.append(f"Short list: only {len(selected)} fund(s) qualified this month.")
+    if flips:
+        L.append("On-deck funds now eligible: " + ", ".join(flips) + ".")
+    if deact:
+        L.append("Deactivated: " + "; ".join(f"{t} - {w}" for t, w in deact.items()))
+    gap_items = [f"{t}: {w}" for t, w in sorted(gaps.items())] + perf_gaps
+    L.append("Data gaps: " + ("; ".join(gap_items) if gap_items else "none."))
+    L.append(f"Proposals pending review: {len(pending)}" + (" - " + "; ".join(p.get("summary", p.get("id", "")) for p in pending[:3]) if pending else "."))
+    L.append(f"Unconstrained top five: {' '.join(comparator) or 'none'}")
+    L.append("Fwd return, list|VOO|unconstrained (%): " + fwd_line)
+    if bootstrapped:
+        L.append("Setup: strategy.json created from the repo defaults (v1).")
+    body = "\n".join(L)
+    if len(body) + 8 > REPORT_LIMIT:
+        body = body[:REPORT_LIMIT - 40] + "\n...(truncated; see history file)"
+    report = "```\n" + body + "\n```\n"
+    with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as fh:
+        fh.write(report)
+
+    # ---- writes (runlog last = idempotency marker)
+    writes.append({"title": "current.json", "path": "out/current.json", "mime": "text/plain", "replace": True})
+    writes.append({"title": "performance.json", "path": "out/performance.json", "mime": "text/plain", "replace": True})
+    writes.append({"title": f"history_{anchor_month}.json", "path": f"out/history_{anchor_month}.json", "mime": "text/plain", "replace": True})
+    writes.append({"title": f"cache_prices_{anchor_month}.json", "path": f"out/cache_prices_{anchor_month}.json", "mime": "text/plain", "replace": True})
+    if changed:
+        writes.append({"title": "universe", "path": "out/universe.csv", "mime": "text/csv", "replace": True})
+    if bootstrapped:
+        shutil.copy(spath, os.path.join(out, "strategy.json"))
+        writes.append({"title": "strategy.json", "path": "out/strategy.json", "mime": "text/plain", "replace": False})
+    if props is None:
+        save_json(os.path.join(out, "proposals.json"), {"proposals": []})
+        writes.append({"title": "proposals.json", "path": "out/proposals.json", "mime": "text/plain", "replace": False})
+    runlog = {
+        "anchor_month": anchor_month, "anchor_date": A.date().isoformat(), "run_utc": now,
+        "strategy_version": strat.get("version"), "tr_basis": tr_basis,
+        "counts": {"universe_active": n_active, "eligible": int(len(df)), "survivors": len(survivors),
+                   "selected": len(selected), "on_watch": len(on_watch)},
+        "selected": selected, "added": added, "removed": removed, "relaxation": steps,
+        "flips": flips, "deactivated": deact, "untradable_input": sorted(untradable),
+        "data_gaps": gaps, "perf_gaps": perf_gaps,
+        "files": [w["title"] for w in writes] + [f"runlog_{anchor_month}.json"],
+        "retry_of_same_month": bool(cur_raw and cur_raw.get("anchor_month") == anchor_month),
+    }
+    save_json(os.path.join(out, f"runlog_{anchor_month}.json"), runlog)
+    writes.append({"title": f"runlog_{anchor_month}.json", "path": f"out/runlog_{anchor_month}.json", "mime": "text/plain", "replace": False})
+    write_writes(wd, writes)
+    print(f"TRADABILITY CHECK LIST: {json.dumps(held)}")
+    print(f"report: {os.path.join(out, 'report.txt')} ({len(report)} chars)")
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--workdir", default="work")
-    ap.add_argument("--backtest", action="store_true", help="run backtest if this is a backtest month")
-    ap.add_argument("--force-backtest", action="store_true")
-    ap.add_argument("--today", default=None, help="YYYY-MM-DD override")
-    ap.add_argument("--fold-local-logs", action="store_true", help="offline use: fold runlog_*.csv files in workdir into the ledger")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plan")
+    p.add_argument("--workdir", default="work")
+    p.add_argument("--today")
+    r = sub.add_parser("run")
+    r.add_argument("--workdir", default="work")
+    r.add_argument("--today")
+    r.add_argument("--untradable", default="")
+    r.add_argument("--bootstrap-strategy", action="store_true")
     a = ap.parse_args()
-    W = a.workdir
-    today = date.fromisoformat(a.today) if a.today else date.today()
+    {"plan": cmd_plan, "run": cmd_run}[a.cmd](a)
 
-    cfg = load_json(os.path.join(W, "config.json"))
-    strategy = load_json(os.path.join(W, "strategy.json"))
-    state = load_json(os.path.join(W, "state.json"), {"cooldowns": {}, "ledger": {"tickers": {}}})
-    uni = pd.read_csv(os.path.join(W, "universe.csv"))
-    uni["ticker"] = uni["ticker"].str.upper().str.strip()
-    bench = cfg.get("benchmark", "VOO")
-    sc = cfg["screening"]
-
-    monthly = load_prices(os.path.join(W, "prices_monthly.csv"))
-    if bench not in monthly.columns:
-        sys.exit(f"benchmark {bench} missing from prices_monthly.csv")
-    mret = monthly_returns(monthly)
-
-    # optional liquidity data
-    vol = {}
-    vp = os.path.join(W, "volumes.csv")
-    if os.path.exists(vp):
-        v = pd.read_csv(vp); vol = dict(zip(v["ticker"].str.upper(), pd.to_numeric(v["avg_volume"], errors="coerce")))
-
-    rows, excluded = [], []
-    b1 = total_return(monthly, bench, 12); b3 = total_return(monthly, bench, 36)
-    for _, u in uni.iterrows():
-        t = u["ticker"]
-        if t == bench or str(u.get("category", "")) == "benchmark":
-            continue
-        if t not in monthly.columns:
-            excluded.append((t, "no price data")); continue
-        r1, r3 = total_return(monthly, t, 12), total_return(monthly, t, 36)
-        if pd.isna(r1) or pd.isna(r3):
-            excluded.append((t, "insufficient history (<37 months)")); continue
-        if t in vol and not pd.isna(vol[t]) and vol[t] < sc["min_avg_daily_volume_shares"]:
-            excluded.append((t, f"avg volume {vol[t]:,.0f} < floor")); continue
-        streak = consecutive_months_under(mret, t, bench)
-        beat1, beat3 = r1 > b1, r3 > b3
-        pruned = streak >= int(sc["prune_after_consecutive_months_under_benchmark"])
-        er = float(u["expense_ratio_pct"]) / 100.0
-        score = (annualized(r1, 1) + annualized(r3, 3)) / 2.0 - float(sc["fee_weight"]) * er
-        passes = (beat1 or not sc["require_beat_benchmark_1y"]) and (beat3 or not sc["require_beat_benchmark_3y"]) and not pruned
-        rows.append({"ticker": t, "category": u["category"], "er_pct": float(u["expense_ratio_pct"]),
-                     "ret_1y": r1, "ret_3y": r3, "beat_1y": beat1, "beat_3y": beat3,
-                     "under_streak": streak, "pruned": pruned, "score": score, "passes": passes})
-    stats = pd.DataFrame(rows).set_index("ticker")
-    survivors = list(stats.index[stats["passes"]])
-
-    # correlation grouping on survivors
-    wp = os.path.join(W, "prices_weekly.csv")
-    if os.path.exists(wp):
-        weekly = load_prices(wp)
-        src = weekly.tail(int(sc["correlation_window_weeks"]))
-        corr_src = "weekly"
-    else:
-        src = monthly.tail(36); corr_src = "monthly (weekly file absent)"
-    avail = [t for t in survivors if t in src.columns]
-    ret = src[avail].pct_change().dropna(how="all")
-    groups = correlation_groups(ret, float(sc["correlation_group_threshold"])) if avail else []
-    cross = group_cross_corr(ret, groups) if len(groups) > 1 else []
-
-    chosen, group_out = [], []
-    for gi, g in enumerate(groups, 1):
-        ranked = stats.loc[g].sort_values("score", ascending=False)
-        best = ranked.index[0]
-        chosen.append(best)
-        group_out.append({"group": gi, "members": g, "chosen": best,
-                          "scores": {t: round(float(stats.loc[t, "score"]) * 100, 2) for t in g}})
-
-    # holdings that fell out (execute.py also checks, but flag here for the monthly report)
-    prev = load_json(os.path.join(W, "candidates.json"), {})
-    prev_chosen = set(prev.get("candidates", []))
-    dropped = sorted(prev_chosen - set(chosen))
-    added = sorted(set(chosen) - prev_chosen)
-
-    # counterfactual from the running ledger kept in state.json by execute.py
-    # (local runlog_*.csv files, if any are present, are folded in too — useful for offline analysis)
-    ledger = state.setdefault("ledger", {"tickers": {}})
-    if a.fold_local_logs:
-        ledger = fold_runlogs_into_ledger(W, ledger)
-    cf = counterfactual_table(ledger)
-
-    # backtest (quarterly by default)
-    bt_msg, bt_applied = "backtest not scheduled this month", None
-    if a.force_backtest or (a.backtest and today.month in cfg["strategy_adaptation"]["backtest_months"]):
-        bt_applied, bt_msg = run_backtest(W, cfg, strategy, survivors, today)
-
-    # outputs
-    out = {"as_of": today.isoformat(), "benchmark": bench,
-           "benchmark_ret_1y": b1, "benchmark_ret_3y": b3,
-           "candidates": chosen, "groups": group_out, "survivors": survivors,
-           "added": added, "dropped": dropped, "correlation_source": corr_src,
-           "strategy_version": strategy.get("version"),
-           "stats": {t: {k: (None if (isinstance(v, float) and math.isnan(v)) else (bool(v) if isinstance(v, (np.bool_, bool)) else (float(v) if isinstance(v, (float, np.floating)) else (int(v) if isinstance(v, (np.integer,)) else v))))
-                         for k, v in r.items()} for t, r in stats.to_dict("index").items()},
-           "excluded": excluded}
-    # candidates.json stays small (it is re-read by every intraday run); details go to screen_detail.json
-    small = {k: out[k] for k in ("as_of", "benchmark", "candidates", "groups", "added", "dropped", "strategy_version")}
-    save_json(os.path.join(W, "candidates.json"), small)
-    save_json(os.path.join(W, "screen_detail.json"), out)
-    save_json(os.path.join(W, "state.json"), state)
-
-    # report
-    L = []
-    L.append(f"AGENTIC ETF - MONTHLY SCREEN  {today.isoformat()}   strategy v{strategy.get('version')}")
-    L.append(f"{bench}: 1y {b1*100:+.1f}%  3y {b3*100:+.1f}%   universe {len(stats)}  survivors {len(survivors)}  groups {len(groups)}")
-    L.append("")
-    L.append("CANDIDATES (one per correlation group; score = avg ann. return - ER)")
-    L.append(f"{'grp':>3} {'ticker':<6} {'score':>7} {'1y':>7} {'3y':>7} {'ER':>5}  members")
-    for g in group_out:
-        t = g["chosen"]; s = stats.loc[t]
-        L.append(f"{g['group']:>3} {t:<6} {s['score']*100:>6.1f}% {s['ret_1y']*100:>6.1f}% {s['ret_3y']*100:>6.1f}% {s['er_pct']:>4.2f}  {', '.join(m for m in g['members'] if m != t) or '-'}")
-    if cross:
-        L.append("")
-        L.append("Between-group avg correlation: " + "  ".join(f"g{a_}-g{b_} {c:.2f}" for a_, b_, c in cross))
-    if added or dropped:
-        L.append("")
-        L.append(f"ADDED: {', '.join(added) or '-'}   DROPPED: {', '.join(dropped) or '-'}  (holdings in dropped are NOT sold - notice only)")
-    L.append("")
-    L.append("PRUNED / FAILED SCREEN")
-    fails = stats[~stats["passes"]].sort_values("score", ascending=False)
-    for t, s in fails.iterrows():
-        if s["pruned"]:
-            why = "pruned: %d mo under %s" % (s["under_streak"], bench)
-        else:
-            why = "under %s on " % bench + "/".join(x for x, ok in (("1y", s["beat_1y"]), ("3y", s["beat_3y"])) if not ok)
-        L.append(f"    {t:<6} 1y {s['ret_1y']*100:>6.1f}% 3y {s['ret_3y']*100:>6.1f}%  {why}")
-    if excluded:
-        L.append("EXCLUDED: " + ", ".join(f"{t} ({r})" for t, r in excluded))
-    L.append("")
-    L.append("DIP-BUY vs BLIND-DCA (same dollars, every run since logging began)")
-    if cf.empty:
-        L.append("    no purchases logged yet")
-    else:
-        L.append(f"    {'ticker':<6} {'$ spent':>8} {'dip basis':>10} {'dca basis':>10} {'adv':>7}")
-        for _, r in cf.sort_values("advantage_pct", ascending=False).iterrows():
-            L.append(f"    {r['ticker']:<6} {r['dollars']:>8.2f} {r['dip_cost_basis']:>10.2f} {r['dca_cost_basis']:>10.2f} {r['advantage_pct']:>+6.2f}%")
-        tot = cf["dollars"].sum()
-        w = float((cf["advantage_pct"] * cf["dollars"]).sum() / tot) if tot else 0.0
-        L.append(f"    weighted advantage {w:+.2f}%  ($ {tot:.2f} total)")
-    L.append("")
-    L.append("STRATEGY: " + bt_msg)
-    report = "\n".join(L)
-    with open(os.path.join(W, "report.txt"), "w") as f:
-        f.write(report)
-    print(report)
-
-    # report.md: same content as Markdown pipe tables. The Slack connector turns these into
-    # native Slack tables, which stay readable on phones; a ``` code block does not.
-    M = []
-    M.append(f"*AGENTIC ETF - MONTHLY SCREEN {today.isoformat()}* (strategy v{strategy.get('version')})")
-    M.append(f"{bench}: 1y {b1*100:+.1f}% · 3y {b3*100:+.1f}% · universe {len(stats)} · survivors {len(survivors)} · groups {len(groups)}")
-    M.append("")
-    M.append("*Candidates* (one per correlation group; score = avg ann. return − ER)")
-    M.append("")
-    M.append("| Grp | Ticker | Score | 1y | 3y | ER | Other members |")
-    M.append("| --- | --- | --- | --- | --- | --- | --- |")
-    for g in group_out:
-        t = g["chosen"]; s = stats.loc[t]
-        M.append(f"| {g['group']} | {t} | {s['score']*100:.1f}% | {s['ret_1y']*100:.1f}% | {s['ret_3y']*100:.1f}% | {s['er_pct']:.2f} | {', '.join(m for m in g['members'] if m != t) or '—'} |")
-    if cross:
-        M.append("")
-        M.append("Between-group avg correlation: " + " · ".join(f"g{a_}–g{b_} {c:.2f}" for a_, b_, c in cross))
-    if added or dropped:
-        M.append("")
-        M.append(f"*ADDED:* {', '.join(added) or '—'}   *DROPPED:* {', '.join(dropped) or '—'}  (holdings in dropped are NOT sold - notice only)")
-    M.append("")
-    M.append("*Pruned / failed screen*")
-    M.append("")
-    M.append("| Ticker | 1y | 3y | Reason |")
-    M.append("| --- | --- | --- | --- |")
-    for t, s in fails.iterrows():
-        if s["pruned"]:
-            why = "pruned: %d mo under %s" % (s["under_streak"], bench)
-        else:
-            why = "under %s on " % bench + "/".join(x for x, ok in (("1y", s["beat_1y"]), ("3y", s["beat_3y"])) if not ok)
-        M.append(f"| {t} | {s['ret_1y']*100:.1f}% | {s['ret_3y']*100:.1f}% | {why} |")
-    if excluded:
-        M.append("")
-        M.append("*Excluded:* " + ", ".join(f"{t} ({r})" for t, r in excluded))
-    M.append("")
-    M.append("*Dip-buy vs blind DCA* (same dollars, every run since logging began)")
-    if cf.empty:
-        M.append("no purchases logged yet")
-    else:
-        M.append("")
-        M.append("| Ticker | $ spent | Dip basis | DCA basis | Adv |")
-        M.append("| --- | --- | --- | --- | --- |")
-        for _, r in cf.sort_values("advantage_pct", ascending=False).iterrows():
-            M.append(f"| {r['ticker']} | {r['dollars']:.2f} | {r['dip_cost_basis']:.2f} | {r['dca_cost_basis']:.2f} | {r['advantage_pct']:+.2f}% |")
-        M.append("")
-        M.append(f"Weighted advantage {w:+.2f}% (${tot:.2f} total)")
-    M.append("")
-    M.append("*Strategy:* " + bt_msg)
-    with open(os.path.join(W, "report.md"), "w") as f:
-        f.write("\n".join(M))
 
 if __name__ == "__main__":
     main()

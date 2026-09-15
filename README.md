@@ -1,101 +1,150 @@
-# Agentic ETF
+# Top-5 Growth ETF Screen (schema `top5-v1`)
 
-Scripts for an automated ETF dip-buying system that runs as scheduled cloud tasks in Claude,
-trades a Robinhood agentic account, keeps state in a Google Drive folder, and reports to Slack.
+This is a notification-only research system. It never places, reviews or cancels orders.
+Three scheduled Claude tasks clone this repo. The scripts here do all the arithmetic, selection and
+report text. The tasks only make the Drive, Robinhood and Slack tool calls and pass script output through.
 
-Nothing in this repo is secret. Account numbers, state, logs, and configuration live in Drive.
+| Task | Schedule (UTC) | Script |
+|---|---|---|
+| Annual Universe Build | `0 9 27 12 *` (Dec 27) | `universe.py` |
+| Monthly Top-5 Screen | `0 9 1 * *` (1st of month) | `screen.py` |
+| Quarterly Parameter Backtest | `0 9 28 3,6,9,12 *` | `backtest.py` |
 
-## How the pieces fit
+Where things live:
 
-| Where | What |
+- Drive folder "Agentic ETF" (`18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu`) holds the state and logs.
+- Reports go to Slack `#agentic-trading` (`C0C15AK3K2R`).
+- Robinhood account `931184287` is used only for tradability checks.
+
+## Files in this folder
+
+| File | Purpose |
 |---|---|
-| this repo (public) | `screen.py`, `execute.py`, `ingest.py`, `drive_text.py` |
-| Google Drive folder **Agentic ETF** | `config.json`, `strategy.json`, `candidates.json`, `state.json` (Docs), `universe` (Sheet), `runlog_<date>_<run>` files (write-once), `screen_detail_<date>.json` (monthly record) |
-| Robinhood | data (historicals, quotes, positions, buying power) and order placement |
-| Slack `#agentic-trading` | one monospaced report per run |
+| `common.py` | Constants (taxonomy, IDs), schema guard, dates, batching, universe CSV I/O |
+| `ingest.py` | Turns saved Robinhood historicals files into a total-return series per ticker |
+| `engine.py` | Stages A-E, shared by the monthly screen and the backtest |
+| `screen.py` | `plan` / `run` for the monthly screen |
+| `backtest.py` | `plan` / `run` for the quarterly backtest |
+| `universe.py` | `plan` / `build` / `verify` for the annual universe |
+| `drive_text.py` | Cleans Google Doc/Sheet text read back through the Drive connector |
+| `strategy_default.json` | Starting parameters (the first monthly run copies them to Drive) |
 
-A scheduled task clones this repo, reads the small state files from Drive, pulls market data
-from Robinhood, runs the scripts, places any orders, writes the state back, and posts to Slack.
+## Drive files (every JSON file carries `"schema_version": "top5-v1"`; a mismatch is a hard fail)
 
-## Token economics (why it is built this way)
+| Title | Written by | Notes |
+|---|---|---|
+| `universe` (Sheet) | annual build; monthly (only when it flips on-deck funds or deactivates funds) | 17 columns, see `common.UNIVERSE_COLUMNS` |
+| `strategy.json` | first monthly run (bootstrap); quarterly backtest (auto-apply only) | never edited by the monthly screen |
+| `current.json` | monthly | top five, on-watch, comparator, previous state |
+| `performance.json` | monthly | one entry per list; forward 1/3/6/12-month returns: list, VOO, unconstrained |
+| `proposals.json` | first monthly run (empty); backtest | never auto-applied |
+| `history_YYYY-MM.json` | monthly | full ranked list with metrics |
+| `cache_prices_YYYY-MM.json` | monthly | compact month-end record (close, TTM dividends, window returns) |
+| `runlog_YYYY-MM.json` | monthly, written last | also the idempotency marker |
+| `backtest_YYYY-MM.json` | backtest, written last | idempotency marker |
+| `universe_build_YYYY-MM-DD.json` | annual build | build report |
 
-Every byte a connector returns lands in the model's context, and every byte the model writes to
-disk costs output tokens. Two facts shape the design:
+The Drive connector cannot overwrite a file. To replace one, the task creates the new file and then trashes the older files with the same title.
 
-1. **Large connector results are saved to disk, not shown to the model.** Above roughly 50k
-   characters, the harness writes the result to a file. `ingest.py` reads those files directly.
-   So every `get_equity_historicals` call is made with **exactly 10 symbols** (pad with universe
-   tickers if needed) and at least a year of daily bars, guaranteeing it lands on disk and costs
-   nothing. A single-ticker call would come back inline and cost ~15k tokens. Never read the
-   saved result files.
-2. **Small values are passed on the command line.** Quotes, positions, and buying power are a
-   dozen numbers; the task transcribes them as `--quotes`, `--positions`, `--buying-power`.
+## Total return: how dividends are handled
 
-Drive's connector cannot overwrite content, so a state write is `create_file` (new) followed by
-`trash_file` (old). Docs come back with markdown escapes; `drive_text.py` strips them and
-validates JSON.
+Robinhood's `adjustment_type="all"` daily bars cause two problems:
 
-## Scripts
+- They subtract dividends as a flat dollar offset instead of scaling prices. Returns computed from those bars come out too high (VGT 2023 shows +81% instead of +53%).
+- Dividends paid before a split are not adjusted for the split.
 
-### `execute.py` (intraday, 09:10 and 14:10 CT on market days)
+So each batch of 10 symbols is fetched three times: `split`, `all` and `none`. `ingest.py` then works out:
 
-```
-python3 execute.py check                      # no files needed; exit 1 if NYSE closed
-python3 ingest.py --workdir work              # saved Robinhood results -> work/prices_daily.csv
-python3 execute.py plan   --workdir work --run 1410 --quotes "SOXX=528.01,..." \
-        --positions "ITA=0.104408@229.87,..." --buying-power 64
-#   -> work/orders.json (what to place), work/report.txt (draft)
-python3 execute.py record --workdir work --run 1410 --filled "SOXX=1.00" (same --quotes/--positions/--buying-power)
-#   -> work/state.json (cooldowns + ledger), work/runlog_<date>_<run>.csv, work/report.txt (final)
-```
+- the raw dividend: the day-to-day change in (split − all)
+- the split factor: none ÷ split
+- a total-return (TR) index from split-adjusted prices plus split-adjusted dividends
 
-Indicators (parameters in `strategy.json`): price at/below the prior N-day low; price at least
-X% below the prior 52-week high; price at/below the lower Bollinger band. Each tripped indicator
-funds `dollars_per_indicator`, at most once per ticker per indicator per trading day. Buys stop
-when buying power would fall below `buying_power_floor`. Only tickers in `candidates.json` are
-bought; holdings that are not candidates are reported, never sold.
+It also cancels Robinhood's multi-bar glitches (a jump followed by an equal and opposite jump). It drops any payout larger than 5% of price unless the unadjusted price gapped down at the open by at least half the payout.
 
-### `screen.py` (monthly, 1st of the month 07:00 CT)
+- **Checked against published figures:** VOO 2017–2025 calendar-year total returns all match (e.g. −18.19% for 2022, +26.32% for 2023, +24.98% for 2024). So do QQQ 2017–2024 and VGT/VUG/SCHG 2022–2023.
+- **Fallback:** if a ticker's dividends can't be verified within the last 5 years, that ticker uses price return plus the `distribution_yield` accrual. The report header names it.
 
-```
-python3 ingest.py --workdir work              # monthly bars for the whole universe (+ weekly/daily when fetched)
-python3 screen.py --workdir work [--backtest]
-#   -> work/candidates.json, work/screen_detail.json, work/state.json, work/strategy.json (if changed), work/report.txt
-```
+The saved result files don't record which adjustment they hold, so the script tells them apart from the data:
 
-Screen: keep ETFs that beat VOO on trailing 1y and 3y; drop any with 3+ consecutive months
-under VOO; cluster survivors by return correlation (average linkage, threshold in config); in each
-cluster choose the highest `mean(annualized 1y, 3y) - expense_ratio`, so a pricier near-twin must
-out-earn its fee gap. Reports the dip-buy vs blind-DCA cost basis from the running ledger. In
-backtest months (Jan/Apr/Jul/Oct) it grid-searches indicator parameters on 2 years of daily bars
-for all survivors and auto-applies a change only if it improves the DCA advantage by at least
-`auto_apply_min_improvement_pp` without a worse drawdown.
+- split vs all differ by a constant on each bar
+- none vs split differ by a ratio on each bar
 
-### `ingest.py`
+## Monthly rules (screen.py + engine.py)
 
-Finds `mcp-Robinhood-get_equity_historicals-*.txt` files the harness saved (under
-`/root/.claude/projects/*/tool-results/`, modified in the last 3 hours) and writes
-`prices_daily.csv` / `prices_weekly.csv` / `prices_monthly.csv` (date,ticker,close,high,low,volume).
+**Anchor date:** the last trading day before the 1st of the run month.
 
-### `drive_text.py`
+**Windows:**
 
-`unescape IN OUT` for Docs (JSON validated when OUT ends in .json); `table2csv IN OUT` for Sheets.
+- 6M, 1Y and 3Y are snapped to the nearest earlier trading day.
+- Correlation uses the trailing 504 trading days.
+- Max drawdown uses available history up to 5 years (never less than 3), and the report shows the years used.
 
-## Files in Drive
+**A. Eligibility**
 
-- `config.json` – account, channel, folder id, execution and screening parameters (edit by hand)
-- `universe` (Sheet) – seed ETF list with expense ratios (edit by hand)
-- `strategy.json` – indicator parameters + version history (scripts update on auto-apply)
-- `candidates.json` – current candidate per correlation group (monthly)
-- `state.json` – cooldowns and the running dip-vs-DCA ledger (every run)
-- `runlog_YYYY-MM-DD_RUN` – one per run, never re-read
-- `screen_detail_YYYY-MM-DD.json` – full monthly screen stats
+- The fund must be active in the universe and at least 39 months past inception.
+- On-deck funds turn active once their `eligible_from` month is reached.
+- Deactivation happens only for hard failures: no price data or stale data, a 30-day median dollar volume under $5M, or failing the Robinhood tradability check on the final list.
+
+**B. Hard filter (never relaxed):** the fund's cumulative total return must beat VOO by at least `excess_min_pp` (0.5) on 6M, 1Y and 3Y.
+
+**C. Score**
+
+`w_6m·ex6 + w_1y·ex1 + w_3y·ex3 − er_penalty·ER + incumbent_bonus`
+
+- `ex6` is the 6M excess, annualized as (1+r)² − (1+r_VOO)².
+- `ex1` is the 1Y excess.
+- `ex3` is the 3Y CAGR difference.
+- ER is the expense ratio in percent.
+- The incumbent bonus applies to funds currently on the list or on-watch.
+- The information ratio (IR) is reported but doesn't count toward the score, unless `scoring="ir"`.
+
+**D. Selection (greedy)**
+
+1. Regress daily returns on VOO and build the correlation matrix of the residuals.
+2. Walk down the ranking, adding a fund only if its residual correlation with every fund already picked is ≤ `resid_corr_max`, and its category differs from theirs.
+3. Within `tie_band` of the best eligible score, the fund with the smaller max drawdown wins.
+4. If fewer than 5 are picked, relax the correlation cap in 0.05 steps up to `resid_corr_ceiling`, then drop the category rule, then publish the short list. Every step is reported.
+5. If 5 or fewer funds pass Stage B, all of them are published as-is.
+
+**E. Exits**
+
+- A fund that fails Stage B is removed immediately.
+- A fund that is deactivated in the universe is removed immediately.
+- The first month outside the top five puts a fund on-watch. It stays on the list and still gets the incumbent bonus. The second consecutive month outside removes it.
+
+**Unconstrained comparator:** the top 5 by raw score (no incumbent bonus), with no correlation or category rule. Its forward returns are tracked the same way as the list's.
+
+**Performance:** equal-weight buy-and-hold forward returns over 1, 3, 6 and 12 months for the held list (top five plus on-watch), the comparator and VOO. The report line shows each horizon's return for the list published that many months earlier.
+
+**Retries:** if `current.json` already holds this anchor month, the script uses the `previous` block stored inside it, so a retried run doesn't count a month outside twice.
+
+## Quarterly backtest (backtest.py)
+
+**When it skips:**
+
+- `strategy.json` doesn't exist yet.
+- Fewer than `min_live_months` (3) monthly screens have been recorded.
+- Fewer than 12 month-ends can be reconstructed.
+
+**How it runs**
+
+- It pulls 10 years of daily data itself; no price caches are needed.
+- It reconstructs the monthly screen at every month-end where 37 months of data exist. Eligibility at each date is based on inception.
+- It tests up to 10 variants. Each variant changes only one group: the three weights, `resid_corr_max`, `er_penalty`, `incumbent_bonus`, or raw vs IR scoring.
+
+**Auto-apply**
+
+- Only the best variant is applied, and only if it beats the current parameters by at least 2.0 pp annualized with a max drawdown no worse.
+- Applying bumps the `strategy.json` version and adds a changelog entry with the numbers.
+
+**Proposals:** other variants that gain at least `min_proposal_pp` (0.5 pp) go to `proposals.json` as pending.
+
+The report always carries a survivorship-bias warning. Until 24 live months exist, it also warns that differences are more likely noise than signal.
 
 ## Local test
 
 ```
-mkdir work && cp config.json strategy.json universe.csv work/
-python3 ingest.py --workdir work --since-minutes 600
-python3 screen.py --workdir work --today 2026-09-01
-python3 execute.py plan --workdir work --run 1410 --quotes "SOXX=528.01" --buying-power 64 --now 2026-09-11T14:10:00-05:00
+python3 screen.py plan --workdir work --today 2026-10-01
+python3 ingest.py --workdir work --results-dir <dir with saved historicals files> --since-minutes 100000
+python3 screen.py run --workdir work --today 2026-10-01 --bootstrap-strategy
 ```
