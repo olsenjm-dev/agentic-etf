@@ -282,7 +282,7 @@ def main():
             # keep the longest / most verified version if a symbol appears in several batches
             if prev is not None:
                 pv = report["tickers"][sym]
-                if (pv["verified"], pv["bars"]) >= (ver, len(df)):
+                if (bool(pv["verified"]), pv["bars"]) >= (bool(ver), len(df)):
                     continue
             frames[sym] = df
             report["tickers"][sym] = {"first": df["date"].iloc[0], "last": df["date"].iloc[-1],
