@@ -1,4 +1,4 @@
-# Top-5 Growth ETF Screen: Scheduled Task Prompts (v5)
+# Top-5 Growth ETF Screen: Scheduled Task Prompts (v6)
 
 These tasks are notification-only and never place trades. Nothing here is investment advice.
 
@@ -6,8 +6,13 @@ Shared references:
 - Drive folder `18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu` ("Agentic ETF")
 - Slack channel `C0C15AK3K2R` (#agentic-trading)
 - Robinhood account `931184287`, used only for tradability checks
-- GitHub repo `olsenjm-dev/agentic-etf` (public); the scripts are in `top5/`
+- GitHub repo `olsenjm-dev/agentic-etf` (public); the scripts are at the repo root
 - Every JSON file carries `"schema_version": "top5-v1"`. A missing or wrong value is a hard fail.
+
+Changes from v5:
+- The scripts live at the repo root (no `top5/` folder); all three prompts now clone and run from `/tmp/agentic-etf`.
+- `ingest.py` no longer crashes when a ticker appears in more than one batch with `--expect 1` (annual build).
+- `universe.py` flags the active count only when it falls outside 60-150. The annual build still widens the enumeration only when fewer than 60 funds are active.
 
 Changes from v4:
 - The annual build moved to Dec 27, one day before the December backtest.
@@ -24,13 +29,13 @@ Changes from v4:
 ```
 Build (or rebuild from scratch) the annual ETF universe for John's Top-5 Growth ETF Screen. This is research only: never place, review or cancel any order. John is not present, so do not ask questions. Make reasonable choices and note them in the Slack summary.
 
-Fixed IDs: Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu ("Agentic ETF"). Slack channel C0C15AK3K2R. Robinhood account 931184287, used for get_equity_tradability only. Repo https://github.com/olsenjm-dev/agentic-etf (scripts in top5/).
+Fixed IDs: Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu ("Agentic ETF"). Slack channel C0C15AK3K2R. Robinhood account 931184287, used for get_equity_tradability only. Repo https://github.com/olsenjm-dev/agentic-etf (scripts at the repo root).
 If a step fails in a way these instructions don't cover, stop and post one Slack message saying which step failed and the error line. Never trash the existing universe unless the new one has passed verification.
 
 1. SETUP
    git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /tmp/agentic-etf
-   cd /tmp/agentic-etf/top5 && mkdir -p /tmp/w
-   Run every command below from /tmp/agentic-etf/top5 with W=/tmp/w.
+   cd /tmp/agentic-etf && mkdir -p /tmp/w
+   Run every command below from /tmp/agentic-etf with W=/tmp/w.
 
 2. EXISTING STATE
    Call search_files with query "parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu'", excludeContentSnippets=true, pageSize=100. Follow next_page_token until the list is complete, and remember each file's title, id and modifiedTime.
@@ -95,13 +100,13 @@ If a step fails in a way these instructions don't cover, stop and post one Slack
 Run the monthly Top-5 Growth ETF screen for John's notification-only research system. Never place, review or cancel any order. John is not present, so do not ask questions.
 Work mechanically. Every number, selection and sentence in the report comes from the repo scripts. Do not compute, summarize or reword market data yourself, and never open the saved Robinhood result files.
 
-Fixed IDs: Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu ("Agentic ETF"). Slack channel C0C15AK3K2R. Robinhood account 931184287 (tradability check only). Repo https://github.com/olsenjm-dev/agentic-etf (scripts in top5/).
+Fixed IDs: Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu ("Agentic ETF"). Slack channel C0C15AK3K2R. Robinhood account 931184287 (tradability check only). Repo https://github.com/olsenjm-dev/agentic-etf (scripts at the repo root).
 If a step fails in a way these instructions don't cover, stop and post one Slack message to C0C15AK3K2R saying which step failed and the error line. Never post partial results as if they were complete.
 
 1. SETUP
    git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /tmp/agentic-etf
-   cd /tmp/agentic-etf/top5 && mkdir -p /tmp/w
-   Run every command below from /tmp/agentic-etf/top5.
+   cd /tmp/agentic-etf && mkdir -p /tmp/w
+   Run every command below from /tmp/agentic-etf.
 
 2. READ DRIVE STATE
    Call search_files with query "parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu'", excludeContentSnippets=true, pageSize=100. Follow next_page_token until the list is complete, and remember each file's title, id and modifiedTime.
@@ -155,12 +160,12 @@ For reference only (the scripts implement all of this; do not re-implement it):
 Run the quarterly parameter backtest for John's Top-5 Growth ETF Screen. This is analysis only: never place, review or cancel any order. John is not present, so do not ask questions.
 strategy.json may change ONLY through the script's auto-apply rule: at least +2.0 pp annualized over the current parameters with a max drawdown no worse. Everything else goes to proposals.json for manual review. Do not compute or judge results yourself; the script does that.
 
-Fixed IDs: Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu ("Agentic ETF"). Slack channel C0C15AK3K2R. Repo https://github.com/olsenjm-dev/agentic-etf (scripts in top5/).
+Fixed IDs: Drive folder 18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu ("Agentic ETF"). Slack channel C0C15AK3K2R. Repo https://github.com/olsenjm-dev/agentic-etf (scripts at the repo root).
 If a step fails in a way these instructions don't cover, stop and post one Slack message saying which step failed and the error line.
 
 1. SETUP
    git clone --depth 1 https://github.com/olsenjm-dev/agentic-etf.git /tmp/agentic-etf
-   cd /tmp/agentic-etf/top5 && mkdir -p /tmp/w
+   cd /tmp/agentic-etf && mkdir -p /tmp/w
 
 2. READ DRIVE STATE
    Call search_files with query "parentId = '18UKCu-XDK4D_lCOXdvoEMt7-lVliEAUu'", excludeContentSnippets=true, pageSize=100. Follow next_page_token until the list is complete, and remember each file's title, id and modifiedTime.
