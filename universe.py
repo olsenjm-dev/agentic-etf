@@ -203,8 +203,8 @@ def cmd_build(a):
 
     L = [f"ETF UNIVERSE BUILD {today} (annual)",
          f"Active: {len(active)} tickers | on-deck: {len(ondeck)} | excluded: {len(excluded)}"]
-    if not 60 <= len(active) <= 120:
-        L.append(f"NOTE: active count {len(active)} is outside the 60-120 target.")
+    if not 60 <= len(active) <= 150:
+        L.append(f"NOTE: active count {len(active)} is outside the 60-150 target.")
     L.append("By category: " + ", ".join(f"{c} {cats.get(c, 0)}" for c in TAXONOMY))
     if ondeck:
         L.append("On-deck: " + ", ".join(f"{r['ticker']} (eligible {r['eligible_from']})" for r in ondeck))
