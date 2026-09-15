@@ -93,10 +93,10 @@ def cmd_plan(a):
 
 
 # ------------------------------------------------------------------ run
-def fmt(x, w, d=1, sign=True):
+def fmt(x, d=1, sign=True):
     if x is None or x != x:
-        return "n/a".rjust(w)
-    return (f"{x:+.{d}f}" if sign else f"{x:.{d}f}").rjust(w)
+        return "n/a"
+    return f"{x:+.{d}f}" if sign else f"{x:.{d}f}"
 
 
 def fwd_return(panel, tickers, d0, d1):
@@ -155,7 +155,8 @@ def update_performance(panel, perf, entry, A):
         e = next((x for x in lists if x["month"] == src), None)
         v = (e or {}).get("fwd", {}).get(str(h))
         if v:
-            parts.append(f"{h}M " + "|".join("n/a" if x is None else f"{x:+.1f}" for x in v))
+            # "/" (not "|") so this plain-text line can never be mistaken for a table row by Slack.
+            parts.append(f"{h}M " + "/".join("n/a" if x is None else f"{x:+.1f}" for x in v))
         else:
             parts.append(f"{h}M n/a")
     return perf, "  ".join(parts), gaps
@@ -335,58 +336,66 @@ def cmd_run(a):
         write_universe(os.path.join(out, "universe.csv"), rows)
 
     # ---- report
+    # Slack-native markdown: prose lines + one real pipe table (Slack renders "|" rows as an
+    # actual table; a fixed-width table only looks right inside a ``` block, which is unreadable
+    # on mobile). No code block, no escaping of the table's structural pipes.
+    def esc(s):
+        return str(s).replace("|", "/")  # guard: a literal "|" in a cell would break the table
+
     L = []
-    L.append(f"TOP-5 GROWTH ETF SCREEN  anchor {A.date()}  (run {today}, strategy v{strat.get('version')})")
-    L.append("Notification only - no orders. Total return: " + tr_basis)
+    L.append(f"*TOP-5 GROWTH ETF SCREEN*  anchor {A.date()}  (run {today}, strategy v{strat.get('version')})")
+    L.append("Notification only - no orders. Total return: " + esc(tr_basis))
     n_active = sum(1 for r in rows if to_bool(r.get("active")))
-    L.append(f"Universe {n_active} active | eligible {len(df)} | passed filter {len(survivors)} | "
+    L.append(f"Universe {n_active} active, eligible {len(df)}, passed filter {len(survivors)}, "
              f"list {len(selected)} + {len(on_watch)} on-watch")
     L.append(f"VOO: 6M {bench['r6']:+.1f}%  1Y {bench['r1']:+.1f}%  3Y {bench['r3']:+.1f}% "
              f"({bench['cagr3']:+.1f}%/yr)")
     L.append("")
-    L.append(" # TICKER CATEGORY         REG     6Mx    1Yx    3Yx   SCORE    IR  MDD(yrs)   ER  STATUS")
+    L.append("| # | Ticker | Category | Reg | 6Mx | 1Yx | 3Yx | Score | IR | MDD (yrs) | ER | Status |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     reg_abbr = {"US": "US", "developed-ex-US": "DXU", "emerging": "EM", "global": "GL"}
 
-    def line(rank, t, status):
+    def row(rank, t, status):
         r = df.loc[t]
-        return (f"{rank:>2} {t:<6} {cat[t][:16]:<16} {reg_abbr.get(r['region'], r['region'][:3]):<4}"
-                f"{fmt(r['ex6a'], 7)}{fmt(r['ex1'], 7)}{fmt(r['ex3a'], 7)}{fmt(sc[t], 8, 2, False)}"
-                f"{fmt(r['ir'], 6, 2, False)} {fmt(r['mdd'], 6)}({r['mdd_years']:.0f}) {r['er']:5.2f}  {status}")
+        return (f"| {rank} | {t} | {esc(cat[t])} | {reg_abbr.get(r['region'], r['region'][:3])} "
+                f"| {fmt(r['ex6a'])} | {fmt(r['ex1'])} | {fmt(r['ex3a'])} | {fmt(sc[t], 2, False)} "
+                f"| {fmt(r['ir'], 2, False)} | {fmt(r['mdd'])} ({r['mdd_years']:.0f}) | {r['er']:.2f} | {esc(status)} |")
     for i, t in enumerate(selected, 1):
-        L.append(line(i, t, "held" if t in prior else "NEW"))
+        L.append(row(i, t, "held" if t in prior else "NEW"))
     for t in sorted(on_watch):
         if t in df.index:
-            L.append(line(ranked_all.index(t) + 1 if t in ranked_all else 0, t, f"on-watch {on_watch[t]}/{P['exit_months_outside']}"))
+            L.append(row(ranked_all.index(t) + 1 if t in ranked_all else 0, t, f"on-watch {on_watch[t]}/{P['exit_months_outside']}"))
         else:
-            L.append(f"   {t:<6} (not evaluated this month)                              on-watch {on_watch[t]}/{P['exit_months_outside']}")
+            L.append(f"| — | {t} | not evaluated this month | | | | | | | | | on-watch {on_watch[t]}/{P['exit_months_outside']} |")
     if not selected:
-        L.append("   (no fund beat VOO on all three windows this month)")
-    L.append("x = excess vs VOO in pp (6M annualized, 1Y, 3Y CAGR). MDD % over years shown. # = rank by score.")
+        L.append("| — | — | no fund beat VOO on all three windows this month | | | | | | | | | |")
     L.append("")
-    L.append("Additions: " + (", ".join(f"{t} (entered the top five)" for t in added) or "none."))
-    L.append("Removals: " + ("; ".join(f"{t} - {why}" for t, why in removed) or "none."))
-    L.append("On-watch: " + (", ".join(f"{t} ({m} month outside the top five; removed at {P['exit_months_outside']})"
+    L.append("_x = excess vs VOO in pp (6M annualized, 1Y, 3Y CAGR). MDD % over years shown. # = rank by score._")
+    L.append("")
+    L.append("*Additions:* " + (", ".join(f"{t} (entered the top five)" for t in added) or "none."))
+    L.append("*Removals:* " + ("; ".join(f"{t} - {esc(why)}" for t, why in removed) or "none."))
+    L.append("*On-watch:* " + (", ".join(f"{t} ({m} month outside the top five; removed at {P['exit_months_outside']})"
                                        for t, m in sorted(on_watch.items())) or "none."))
-    L.append("Near misses: " + ("; ".join(f"#{k} {t} score {s:.2f} - {why}" for k, t, s, why in near) or "none."))
-    L.append("Relaxation: " + ("; ".join(steps) if steps else
+    L.append("*Near misses:* " + ("; ".join(f"#{k} {t} score {s:.2f} - {esc(why)}" for k, t, s, why in near) or "none."))
+    L.append("*Relaxation:* " + ("; ".join(steps) if steps else
                                f"none (resid corr <= {float(P['resid_corr_max']):.2f}, one fund per category)."))
     if len(selected) < int(P["top_n"]):
         L.append(f"Short list: only {len(selected)} fund(s) qualified this month.")
     if flips:
         L.append("On-deck funds now eligible: " + ", ".join(flips) + ".")
     if deact:
-        L.append("Deactivated: " + "; ".join(f"{t} - {w}" for t, w in deact.items()))
+        L.append("Deactivated: " + "; ".join(f"{t} - {esc(w)}" for t, w in deact.items()))
     gap_items = [f"{t}: {w}" for t, w in sorted(gaps.items())] + perf_gaps
-    L.append("Data gaps: " + ("; ".join(gap_items) if gap_items else "none."))
-    L.append(f"Proposals pending review: {len(pending)}" + (" - " + "; ".join(p.get("summary", p.get("id", "")) for p in pending[:3]) if pending else "."))
-    L.append(f"Unconstrained top five: {' '.join(comparator) or 'none'}")
-    L.append("Fwd return, list|VOO|unconstrained (%): " + fwd_line)
+    L.append("*Data gaps:* " + ("; ".join(gap_items) if gap_items else "none."))
+    L.append(f"*Proposals pending review:* {len(pending)}" + (" - " + "; ".join(p.get("summary", p.get("id", "")) for p in pending[:3]) if pending else "."))
+    L.append(f"*Unconstrained top five:* {' '.join(comparator) or 'none'}")
+    L.append("*Fwd return (list / VOO / unconstrained, %):* " + fwd_line)
     if bootstrapped:
         L.append("Setup: strategy.json created from the repo defaults (v1).")
     body = "\n".join(L)
-    if len(body) + 8 > REPORT_LIMIT:
+    if len(body) > REPORT_LIMIT:
         body = body[:REPORT_LIMIT - 40] + "\n...(truncated; see history file)"
-    report = "```\n" + body + "\n```\n"
+    report = body + "\n"
     with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as fh:
         fh.write(report)
 

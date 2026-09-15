@@ -1,4 +1,4 @@
-# Top-5 Growth ETF Screen: Scheduled Task Prompts (v6)
+# Top-5 Growth ETF Screen: Scheduled Task Prompts (v7)
 
 These tasks are notification-only and never place trades. Nothing here is investment advice.
 
@@ -8,6 +8,9 @@ Shared references:
 - Robinhood account `931184287`, used only for tradability checks
 - GitHub repo `olsenjm-dev/agentic-etf` (public); the scripts are at the repo root
 - Every JSON file carries `"schema_version": "top5-v1"`. A missing or wrong value is a hard fail.
+
+Changes from v6:
+- `screen.py`'s monthly report is now plain Slack markdown with a real `|` pipe table (rendered natively by Slack), matching the style used by the "All Accounts Buy Signal Check" task. It is no longer wrapped in a ``` code block - a fixed-width monospace table only lines up inside a code block, which renders unreadably on mobile Slack.
 
 Changes from v5:
 - The scripts live at the repo root (no `top5/` folder); all three prompts now clone and run from `/tmp/agentic-etf`.
@@ -139,7 +142,7 @@ If a step fails in a way these instructions don't cover, stop and post one Slack
    The runlog is written last on purpose. If any earlier write fails, stop before writing the runlog.
 
 7. SLACK
-   Post one message to C0C15AK3K2R whose text is exactly the contents of /tmp/w/out/report.txt (already inside a ``` code block; don't change it). If step 5 used --untradable, or step 6 had a problem, add one short line after the code block saying so.
+   Post one message to C0C15AK3K2R whose text is exactly the contents of /tmp/w/out/report.txt (plain Slack markdown containing a real `|` pipe table - do NOT wrap it in a ``` code block and do NOT escape the table's structural pipes; send it exactly as written). If step 5 used --untradable, or step 6 had a problem, add one short line after it saying so.
 
 For reference only (the scripts implement all of this; do not re-implement it):
 - Anchor date: the last trading day of the prior month.
